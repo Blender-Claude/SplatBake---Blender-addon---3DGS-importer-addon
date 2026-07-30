@@ -28,20 +28,26 @@ Modules:
     lighting   - scene-lit bake material (opt-in, self-contained)
     uvtools    - UV unwrap + colour-to-texture rasteriser for the
                  solid surface bake (self-contained)
+    persist    - stores a reload recipe on each handle so models come back
+                 when a .blend is reopened (self-contained)
     operators  - load / clear / reset / duplicate / delete / undo / restore
     ui         - the N-panel and the scene properties
 """
 
-from . import state, operators, ui
+from . import state, operators, ui, persist
 
 
 def register():
     operators.register()
     ui.register()
     state.register()
+    # Last: the load_post handler needs the properties and operators in place
+    # before it can restore anything.
+    persist.register()
 
 
 def unregister():
+    persist.unregister()
     state.unregister()
     ui.unregister()
     operators.unregister()

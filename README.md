@@ -241,11 +241,82 @@ you want the strays gone from the data as well.
 | `boxes.py` | proxy Empties driving each model's transform |
 | `lighting.py` | scene-lit bake material (self-contained) |
 | `uvtools.py` | UV unwrap and colour-to-texture rasteriser (self-contained) |
+| `persist.py` | reload recipes, so models survive save/reopen (self-contained) |
 | `operators.py` | import, bake, snapshot, edit operators |
 | `ui.py` | the N-panel and scene properties |
 
-`lighting.py` and `uvtools.py` are deliberately standalone, so the optional
-features can change without touching the render path.
+`lighting.py`, `uvtools.py` and `persist.py` are deliberately standalone, so
+the optional features can change without touching the render path.
+
+## Known limitations
+
+Honest list, so nothing comes as a surprise.
+
+**Splat models reload from their source files, so keep those files.** Saving a
+`.blend` does not write the splats into it — a multi-million-splat cloud is
+hundreds of megabytes, and every save would carry it. Instead each handle
+stores a small *recipe*: the source path, the import options, and the rest
+transform. Reopen the file and the models come back automatically, a moment
+after the window appears.
+
+What this means in practice:
+
+- **Don't move or delete the source file**, or rename the folder it lives in.
+  Both a relative and an absolute path are recorded, so moving the whole
+  project folder is fine; moving just the splat file is not. If a source has
+  gone missing, the system console names it and the rest of the scene still
+  loads.
+- **Splats you deleted stay deleted.** The alive mask is packed to one bit per
+  splat and compressed — on a 1.9M-splat model with 1% deleted that is about
+  40 KB, versus 404 MB for the raw splat data.
+- **Reopening is as slow as importing was**, since the file is re-read. Loading
+  is deferred and staggered so Blender opens promptly rather than freezing.
+- **Baked meshes are ordinary geometry** and are saved in the `.blend` as
+  normal — they need no source file at all.
+
+**Experimental — React to Scene Lights.** Works, but read the section above
+first: if you are not in *Rendered* shading (or *Material Preview* with Scene
+Lights **and** Scene World ticked) it will look unlit, which is a viewport
+setting rather than a bug. A capture also has its own lighting baked into the
+colours, so new lamps multiply with the old ones.
+
+**SOG decoding leans on Blender's own WebP loader.** The maths is verified
+against real files, but the pixel read goes through Blender's image system,
+which varies by build. If a `.sog` imports as garbage geometry, this is the
+first thing to suspect — please report it with your Blender version.
+
+**Streamed SOG does not stream.** There is no camera-distance loading in
+Blender, so the levels you choose are simply stacked at import.
+
+**Baked discs are frozen.** A disc bake captures the model's transform at bake
+time; move the splats afterwards and the bake stays where it was. Re-bake.
+
+**STL carries no colour.** No UVs, no vertex colours — by format design. Use
+OBJ or glTF if the texture needs to travel.
+
+**Large scenes need RAM.** A 6M-splat streamed scene with degree-3 spherical
+harmonics is well over a gigabyte before Blender's own overhead. Use the
+Max Splats budget and the Streamed SOG Detail options.
+
+**Ctrl+C on a mixed selection** copies the splat models and leaves ordinary
+Blender objects to Blender's own clipboard; the two do not merge into one
+paste. Copy them in separate passes.
+
+## Reporting a bug
+
+Bug reports are welcome. Please include:
+
+1. **Blender version**, OS, and GPU.
+2. **The add-on version** (shown in the panel header and in Preferences).
+3. **What you did**, and what you expected instead.
+4. **The traceback from the system console** — this is the single most useful
+   thing you can send. *Window → Toggle System Console* on Windows, or launch
+   Blender from a terminal on macOS/Linux. Many operations print the real
+   cause there even when the status bar shows only a short message.
+5. **The file**, if it is a loading problem and you are able to share it — and
+   its format (`.ply`, `.splat`, `.sog`, streamed `lod-meta.json`).
+
+For import problems, it also helps a lot to say which tool exported the file.
 
 ## Acknowledgements
 

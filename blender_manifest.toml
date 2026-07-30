@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "splatbake"
-version = "1.0.9"
+version = "1.2.0"
 name = "Splatbake (WIP)"
 tagline = "Import a Gaussian splat, bake it to real geometry, render it"
 maintainer = "Blender-Claude and MMJ"
@@ -42,4 +42,6 @@ paths_exclude_pattern = [
   # Screenshots are for the repo's README on the web, not for the installed
   # add-on - no need to put 1.6 MB of PNG in everyone's add-ons folder.
   "/docs/",
+  # Issue templates belong to the repository, not to the shipped add-on.
+  "/.github/",
 ]

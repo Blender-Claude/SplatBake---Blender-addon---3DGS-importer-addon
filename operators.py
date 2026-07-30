@@ -122,6 +122,21 @@ class FGS_OT_load(Operator, ImportHelper):
 
         wm.progress_update(90)
         state.add_renderer(r)
+        # Store the recipe on the handle so the model comes back when this
+        # .blend is reopened. Never fatal: a model that cannot be remembered
+        # still works for this session.
+        try:
+            from . import persist
+            persist.remember(r, self.filepath, {
+                "use_sh": self.use_sh,
+                "max_points": self.max_points,
+                "weighted": self.weighted,
+                "trim": self.trim,
+                "upright": self.upright,
+                "lod": self.lod,
+            })
+        except Exception as e:
+            print("[SplatBake] could not record the reload recipe:", e)
         # Everything is loaded by now; the reveal below is purely cosmetic.
         # Pre-warm the shaders/batches/sort so its frames are all cheap.
         try:
@@ -254,6 +269,15 @@ class FGS_OT_duplicate(Operator):
             self.report({'ERROR'}, f"Duplicate failed: {e}")
             return {'CANCELLED'}
         state.add_renderer(r)
+        try:
+            from . import persist
+            if persist.KEY in src_box:
+                rec = dict(src_box[persist.KEY])
+                rec["rest_inv"] = [float(v) for row in r.rest_inv for v in row]
+                empty[persist.KEY] = rec
+                persist.update_alive(r)
+        except Exception as e:
+            print("[SplatBake] duplicate kept no reload recipe:", e)
         state.tag_redraw(context)
         self.report({'INFO'}, f"Duplicated ({len(state.RENDERERS)} models)")
         return {'FINISHED'}
@@ -335,6 +359,19 @@ class FGS_OT_paste(Operator):
                 self.report({'ERROR'}, f"Paste failed: {e}")
                 return {'CANCELLED'}
             state.add_renderer(r)
+            # Carry the original's reload recipe onto the copy, with the
+            # copy's own rest transform and alive mask.
+            try:
+                from . import persist
+                src_box = bpy.data.objects.get(entry["name"])
+                if src_box is not None and persist.KEY in src_box:
+                    rec = dict(src_box[persist.KEY])
+                    rec["rest_inv"] = [float(v) for row in r.rest_inv
+                                       for v in row]
+                    empty[persist.KEY] = rec
+                    persist.update_alive(r)
+            except Exception as e:
+                print("[SplatBake] copy kept no reload recipe:", e)
             made.append(empty)
 
         # Select exactly what was pasted, so G / R / S act on it immediately.

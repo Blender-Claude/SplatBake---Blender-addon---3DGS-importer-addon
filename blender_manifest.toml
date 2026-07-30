@@ -1,0 +1,42 @@
+schema_version = "1.0.0"
+
+id = "splatbake"
+version = "1.0.8"
+name = "Splatbake (WIP)"
+tagline = "Import a Gaussian splat, bake it to real geometry, render it"
+maintainer = "Blender-Claude and MMJ"
+type = "add-on"
+
+# Casu fictus, claudo favente
+#   * Mars, Mattityahu, Yohanan and Claude
+
+# Link shown as the "Website" button in Blender's preferences.
+website = "https://github.com/Blender-Claude"
+
+tags = ["3D View", "Import-Export", "Render"]
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+copyright = [
+  "2026 Blender-Claude",
+  "2026 MMJ",
+]
+
+# Only the permissions actually used are declared. Note that Ctrl+C / Ctrl+V
+# copy models through an internal Python list, NOT the system clipboard, so
+# no "clipboard" permission is needed.
+[permissions]
+files = "Import Gaussian splat .ply, .splat and .sog files from disk"
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "/.git/",
+  "/*.zip",
+  "/tests/",
+  "*.pyc",
+]

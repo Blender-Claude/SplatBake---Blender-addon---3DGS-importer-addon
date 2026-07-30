@@ -25,6 +25,22 @@ That's the whole idea. Everything else in the panel is optional tuning.
 
 ---
 
+## Example
+
+![Suzanne inside a raspberry Gaussian splat](docs/raspberry-suzanne.png)
+
+*Image description: Suzanne (OBJ mesh) inside a Raspberry (3DGS / PLY Gaussian
+splat).*
+
+### Credits
+
+3DGS object — Raspberry:
+
+- [Raspberry — SuperSplat](https://superspl.at/scene/04bdd392)
+- [www.patreon.com/DanyBittel](https://www.patreon.com/DanyBittel)
+
+---
+
 ## Install
 
 Blender 4.2 or newer.

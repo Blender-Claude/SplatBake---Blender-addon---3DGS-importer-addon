@@ -8,7 +8,7 @@ global splat-delete history.
 
 import bpy
 
-VERSION = "1.0.8"
+VERSION = "1.0.9"
 
 RENDERERS = []          # active SplatRenderer instances
 ACTIVE = None           # the renderer last clicked / loaded

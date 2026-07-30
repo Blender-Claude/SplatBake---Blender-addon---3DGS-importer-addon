@@ -55,14 +55,16 @@ The panel appears in the 3D viewport sidebar (press **N**) under the
 2. Click the model to select it, then move it with Blender's own tools —
    `G` / `R` / `S` — exactly as you would any other object. `Ctrl+C` /
    `Ctrl+V` copy and paste it, and `H` / `Alt+H` hide and unhide it.
-3. Press **Max Detail** if you want maximum viewport crispness.
+3. Press **Max Detail** if you want maximum viewport crispness. 
+(Tip: Use pointcloud while in viewport to enhance the perfomence when setting up the scene)
+   3.1 Use the AA composition for "natural" true colors. (Removes whitning/ noize in GS object).     
 4. Pick a bake:
-   - **Bake Discs** — one soft gaussian disc per splat. Closest to the
+   - **Bake Discs** (_Recommended_) — one soft gaussian disc per splat. Closest to the
      captured look. Renders in Cycles and EEVEE with reflections, depth of
      field and motion blur.
-   - **Bake Solid Surface** — one watertight mesh, UV-unwrapped and textured.
+   - **Bake Solid Surface** (WIP) — one watertight mesh, UV-unwrapped and textured.
      Lit by your scene, sculptable, retopologisable, and exportable.
-5. **F12.**
+7. **F12.**
 
 If you only want an image and not geometry, **Snapshot Still** captures the
 live viewport (splats included) at render resolution — the fastest route to a

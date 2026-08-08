@@ -64,8 +64,15 @@ def _pack_alive(alive):
 
 def _unpack_alive(text, n):
     bits = np.frombuffer(zlib.decompress(base64.b64decode(text)), dtype=np.uint8)
+    # packbits pads to a whole byte, so a mask for `n` splats is exactly
+    # ceil(n/8) bytes. Checking the BYTE count catches a mask belonging to a
+    # different model; checking only the truncated length would not, because
+    # a longer mask silently slices down to n and applies the wrong bits.
+    if len(bits) != (n + 7) // 8:
+        raise ValueError(f"alive mask is for a different splat count "
+                         f"({len(bits) * 8} bits, expected {n})")
     mask = np.unpackbits(bits)[:n].astype(bool)
-    if len(mask) != n:                     # count changed -> mask is useless
+    if len(mask) != n:
         raise ValueError("alive mask length does not match the model")
     return mask
 
@@ -234,14 +241,88 @@ def _on_load(*args):
         bpy.app.timers.register(_drain, first_interval=0.2)
 
 
+def sync_from_blend():
+    """Re-read every model's alive mask from its handle Empty.
+
+    This is what makes Ctrl+Z work on splat deletion. The alive mask is a
+    numpy array in Python module state, and Blender's undo system only ever
+    snapshots its own database - it cannot see, save or roll back a module
+    variable. So no amount of undo would bring a deleted splat back, in ANY
+    Blender version; this is architectural rather than a 4.x bug.
+
+    The fix is to keep the authoritative copy where undo CAN see it: the
+    packed mask already stored as an ID property on the handle (the same one
+    that makes models survive a reopen). Blender snapshots object custom
+    properties, so after an undo the property holds the older mask - and this
+    function copies it back into the renderer.
+    """
+    changed = False
+    for r in list(state.RENDERERS):
+        box = bpy.data.objects.get(r.box_name)
+        if box is None or KEY not in box:
+            continue
+        try:
+            rec = box[KEY]
+            packed = rec.get("alive") if hasattr(rec, "get") else None
+        except Exception:
+            continue
+        try:
+            want = (_unpack_alive(packed, r.N) if packed
+                    else np.ones(r.N, dtype=bool))
+        except Exception:
+            continue
+        if want.shape != r.alive.shape or np.array_equal(want, r.alive):
+            continue
+        r.alive[:] = want
+        r._force = True
+        r._alive_ver += 1
+        changed = True
+    if changed:
+        state.redraw_all()
+    return changed
+
+
+def push_undo(message="Edit Splats"):
+    """Record the current masks in Blender data and add an undo step, so the
+    edit can be rolled back with Ctrl+Z like any other Blender change."""
+    for r in list(state.RENDERERS):
+        update_alive(r)
+    try:
+        bpy.ops.ed.undo_push(message=message)
+    except Exception as e:
+        print("[SplatBake] could not push an undo step:", e)
+
+
+@bpy.app.handlers.persistent
+def _on_undo(*args):
+    # Two different things can need undoing: whole models (the handle Empty
+    # came back, so re-attach its renderer) and deleted splats within a model
+    # (the stored mask rolled back, so re-apply it).
+    try:
+        if state.recover_orphans():
+            state.redraw_all()
+    except Exception as e:
+        print("[SplatBake] model recovery after undo failed:", e)
+    try:
+        sync_from_blend()
+    except Exception as e:
+        print("[SplatBake] undo resync failed:", e)
+
+
 def register():
     if _on_load not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_on_load)
+    for h in (bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
+        if _on_undo not in h:
+            h.append(_on_undo)
 
 
 def unregister():
     if _on_load in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_on_load)
+    for h in (bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
+        if _on_undo in h:
+            h.remove(_on_undo)
     _PENDING.clear()
     _FAILED.clear()
     if bpy.app.timers.is_registered(_drain):

@@ -28,16 +28,20 @@ Modules:
     lighting   - scene-lit bake material (opt-in, self-contained)
     uvtools    - UV unwrap + colour-to-texture rasteriser for the
                  solid surface bake (self-contained)
+    permodel   - optional per-model display settings (self-contained)
     persist    - stores a reload recipe on each handle so models come back
                  when a .blend is reopened (self-contained)
     operators  - load / clear / reset / duplicate / delete / undo / restore
     ui         - the N-panel and the scene properties
 """
 
-from . import state, operators, ui, persist
+from . import state, operators, ui, persist, permodel
 
 
 def register():
+    # First: the per-model PropertyGroup must exist before the panel or the
+    # draw callback can reference Object.splatbake_display.
+    permodel.register()
     operators.register()
     ui.register()
     state.register()
@@ -51,3 +55,4 @@ def unregister():
     state.unregister()
     ui.unregister()
     operators.unregister()
+    permodel.unregister()

@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "splatbake"
-version = "1.2.0"
+version = "1.11.1"
 name = "Splatbake (WIP)"
 tagline = "Import a Gaussian splat, bake it to real geometry, render it"
 maintainer = "Blender-Claude and MMJ"

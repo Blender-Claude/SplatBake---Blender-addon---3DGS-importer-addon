@@ -59,10 +59,63 @@ class FGS_PT_main(Panel):
         self.layout.label(text="version " + state.VERSION, icon="INFO")
         col = self.layout.column(align=True)
         col.scale_y = 1.35
-        col.operator("fgs.load_splat", text="Import Splat (.ply / .sog)",
+        col.operator("fgs.load_splat", text="Import Splat (.ply / .sog / .zip)",
                      icon="IMPORT")
 
         self.layout.prop(sc, "fgs_wave_on")
+
+        perf = self.layout.column(align=True)
+        perf.prop(sc, "fgs_points_moving")
+        perf.prop(sc, "fgs_adaptive_sort")
+        perf.prop(sc, "fgs_cull_frustum")
+
+        self.layout.prop(sc, "fgs_per_model")
+        if sc.fgs_per_model:
+            pbox = self.layout.box()
+            act = state.active_renderer(context)
+            obj = (bpy.data.objects.get(act.box_name) if act else None)
+            if obj is None:
+                pbox.label(text="Select a model to edit it", icon="INFO")
+            else:
+                d = obj.splatbake_display
+                pbox.label(text=obj.name, icon="OUTLINER_OB_POINTCLOUD")
+                prow = pbox.row(align=True)
+                prow.prop(d, "display_mode", expand=True)
+                if d.display_mode != 'SPLAT':
+                    pbox.prop(d, "point_size", slider=True)
+                col = pbox.column(align=True)
+                col.prop(d, "density", slider=True)
+                col.prop(d, "splat_scale", slider=True)
+                col.prop(d, "max_pixels", slider=True)
+                col.prop(d, "opacity", slider=True)
+                pbox.prop(d, "sh_quality", text="SH")
+                pbox.operator("fgs.apply_display_to_all",
+                              text="Apply to All Models", icon="DUPLICATE")
+
+        act_r = state.active_renderer(context)
+        act_box = (bpy.data.objects.get(act_r.box_name) if act_r else None)
+        if act_box is not None:
+            try:
+                from . import persist
+                rec = act_box.get(persist.KEY)
+                src = (rec.get("file") or "") if rec else ""
+                if src.endswith("lod-meta.json"):
+                    lbox = self.layout.box()
+                    lbox.label(text="Streamed detail level:", icon="MOD_REMESH")
+                    lrow = lbox.row(align=True)
+                    for ident, label in (('FULL', "Full"), ('MEDIUM', "Med"),
+                                         ('COARSE', "Coarse"), ('ALL', "All")):
+                        lrow.operator("fgs.reload_lod",
+                                      text=label).lod = ident
+                    hint = lbox.column(align=True)
+                    hint.scale_y = 0.75
+                    hint.label(text="Levels are alternatives, not layers.")
+                    hint.label(text="Thin-looking? Try Coarse or All.")
+            except Exception:
+                pass
+
+        self.layout.operator("fgs.walk_navigation", text="Navigation",
+                             icon="VIEW_CAMERA")
 
         row = self.layout.row(align=True)
         row.operator("fgs.frame_scene", text="Frame", icon="VIEWZOOM")
@@ -78,12 +131,43 @@ class FGS_PT_main(Panel):
         # back; nothing else needs changing.
         # col2.prop(sc, "fgs_raw_tones", toggle=True, icon="COLOR",
         #           invert_checkbox=True)
-        drow = self.layout.row(align=True)
-        drow.prop(sc, "fgs_display_mode", expand=True)
+        # These are the settings per-model mode takes over. Grey them out
+        # when it is on, instead of leaving controls that silently do
+        # nothing - an inert dropdown reads as a broken one.
+        gcol = self.layout.column()
+        gcol.enabled = not sc.fgs_per_model
+        grow = gcol.row(align=True)
+        grow.prop(sc, "fgs_display_mode", expand=True)
         if sc.fgs_display_mode != 'SPLAT':
-            self.layout.prop(sc, "fgs_point_size", slider=True)
-        self.layout.prop(sc, "fgs_density", slider=True)
-        self.layout.prop(sc, "fgs_sh_quality", text="SH")
+            gcol.prop(sc, "fgs_point_size", slider=True)
+        gcol.prop(sc, "fgs_density", slider=True)
+        any_sh = any(r.has_sh for r in state.RENDERERS)
+        shrow = gcol.row(align=True)
+        shrow.enabled = any_sh
+        shrow.prop(sc, "fgs_sh_quality", text="SH")
+        if state.RENDERERS and not any_sh:
+            note = gcol.row()
+            note.scale_y = 0.75
+            note.label(text="This file has no view-dependent colour",
+                       icon="INFO")
+
+        act_r = state.active_renderer(context)
+        if act_r is not None:
+            abox = bpy.data.objects.get(act_r.box_name)
+            streamed = False
+            try:
+                from . import persist
+                rec = abox.get(persist.KEY) if abox else None
+                streamed = bool(rec and str(rec.get("file", "")).lower()
+                                .endswith("lod-meta.json"))
+            except Exception:
+                pass
+            if streamed:
+                lbox = self.layout.box()
+                lbox.label(text="Streamed SOG detail:", icon="MOD_MULTIRES")
+                lbox.operator("fgs.reload_lod", text="Reload at Detail Level",
+                              icon="FILE_REFRESH")
+
 
         dbox = self.layout.box()
         dbox.label(text="Detail:", icon="SHADING_RENDERED")
@@ -94,11 +178,6 @@ class FGS_PT_main(Panel):
         dcol.prop(sc, "fgs_despike", slider=True)
         dcol.prop(sc, "fgs_max_pixels", slider=True)
         dbox.prop(sc, "fgs_antialias")
-        pcol = dbox.column(align=True)
-        pcol.prop(sc, "fgs_solid_fast")
-        sub = pcol.row(align=True)
-        sub.enabled = sc.fgs_solid_fast
-        sub.prop(sc, "fgs_solid_density", slider=True)
 
         rbox = self.layout.box()
         rbox.label(text="Render:", icon="RESTRICT_RENDER_OFF")
@@ -154,6 +233,18 @@ class FGS_PT_main(Panel):
                                   icon="HIDE_ON")
         else:
             self.layout.label(text="Import a splat file to begin")
+
+
+def _seed_per_model(self, context):
+    """Turning per-model settings on copies the scene values onto every model,
+    so the view does not jump the moment it is enabled."""
+    if getattr(context.scene, "fgs_per_model", False):
+        try:
+            from . import permodel
+            permodel.seed_from_scene(context.scene, state.RENDERERS)
+        except Exception as e:
+            print("[SplatBake] could not seed per-model settings:", e)
+    state.tag_redraw(context)
 
 
 def _redraw(self, context):
@@ -215,7 +306,7 @@ def register():
              "the web twin exactly"),
         ])
     S.fgs_wave_on = BoolProperty(
-        name="Reveal Animation on Import", default=True,
+        name="Reveal Animation on Import", default=False,
         description="Play the point-cloud -> gaussian reveal when a model is "
                     "imported (this scene only). The default for all files "
                     "lives in Add-on Preferences. Purely cosmetic: the model "
@@ -241,7 +332,7 @@ def register():
     S.fgs_show_bbox = BoolProperty(name="Show Handle", default=False,
                                    update=_redraw)
     S.fgs_display_mode = EnumProperty(
-        name="Display", default='SPLAT', update=_redraw,
+        name="Display", default='POINTS', update=_redraw,
         description="How the model is drawn",
         items=[('SPLAT', "Splats", "Full gaussian rendering"),
                ('POINTS', "Point Cloud", "Scattered dots - fastest, shows "
@@ -276,18 +367,37 @@ def register():
                     "distant splats")
     S.fgs_hq_sort = BoolProperty(name="Per-frame Sort", default=True,
                                  update=_redraw)
-    S.fgs_solid_fast = BoolProperty(
-        name="Fast Solid-Mode Preview", default=True, update=_redraw,
-        description="While viewport shading is Solid or Wireframe, draw fewer "
-                    "splats, skip view-dependent colour and re-sort less "
-                    "often, for smoother navigation before you bake. Material "
-                    "Preview and Rendered stay at full quality")
-    S.fgs_solid_density = FloatProperty(
-        name="Solid Detail", default=25.0, min=1.0, max=100.0,
-        subtype='PERCENTAGE', update=_redraw,
-        description="Fraction of splats drawn in Solid/Wireframe shading. "
-                    "25% is roughly 4x less to sort and draw; drop to 10% on "
-                    "very heavy scenes, raise if the preview is too sparse")
+    S.fgs_points_moving = BoolProperty(
+        name="Point Cloud While Moving", default=False, update=_redraw,
+        description="Drop to a point cloud the instant the view starts "
+                    "moving, and return to splats about a second after it "
+                    "stops. Works for every kind of movement - orbit, pan, "
+                    "walk, fly, or an animated camera")
+    S.fgs_adaptive_sort = BoolProperty(
+        name="Adaptive Depth Sort", default=True, update=_redraw,
+        description="While the view is moving, sort splats into 256 depth "
+                    "buckets instead of ordering them exactly - measured "
+                    "about 12x faster on a 9M-splat scene. The buckets are "
+                    "spaced by 1/distance, so the near field keeps fine "
+                    "ordering and only far geometry is approximated. The "
+                    "exact sort runs the moment the camera stops, so whatever "
+                    "you settle on looking at is always correctly blended")
+    S.fgs_cull_frustum = BoolProperty(
+        name="Cull Off-Screen Splats (Experimental)", default=False,
+        update=_redraw,
+        description="Skip splats outside the view before sorting them. The "
+                    "depth sort is the dominant cost while navigating and it "
+                    "scales worse than linearly, so dropping what you cannot "
+                    "see speeds it up several times over. Nothing visible is "
+                    "removed - each splat's own radius is allowed for, so "
+                    "large background splats do not flicker at the frame edge")
+    S.fgs_per_model = BoolProperty(
+        name="Per-Model Settings", default=False, update=_seed_per_model,
+        description="Give every model its own display settings instead of one "
+                    "set shared by all - so one splat can be a point cloud "
+                    "while another stays full gaussian. Switching this on "
+                    "copies the current settings onto every model first, so "
+                    "nothing changes until you edit something")
     S.fgs_lod = BoolProperty(name="Distance LOD", default=False, update=_redraw)
     S.fgs_lod_points = BoolProperty(name="Point Cloud beyond 30u",
                                     default=False, update=_redraw)
@@ -314,7 +424,8 @@ def unregister():
               "fgs_max_pixels", "fgs_exposure", "fgs_antialias", "fgs_use_sh",
               "fgs_display_mode", "fgs_point_size", "fgs_hq_sort", "fgs_despike",
               "fgs_lod", "fgs_lod_points", "fgs_show_bbox",
-              "fgs_solid_fast", "fgs_solid_density",
+              "fgs_per_model", "fgs_cull_frustum", "fgs_adaptive_sort",
+              "fgs_points_moving",
               "fgs_saturation", "fgs_gamma", "fgs_tint"):
         if hasattr(S, p):
             delattr(S, p)

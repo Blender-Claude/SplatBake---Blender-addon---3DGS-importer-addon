@@ -8,12 +8,20 @@ global splat-delete history.
 
 import bpy
 
-VERSION = "1.2.0"
+VERSION = "1.11.1"
 
 RENDERERS = []          # active SplatRenderer instances
 ACTIVE = None           # the renderer last clicked / loaded
 _HANDLE = None          # the SpaceView3D draw handler
 DELETE_HISTORY = []     # (renderer, splat_id) for global undo
+
+# Models whose handle Empty was deleted. Blender's undo restores the Empty,
+# but the renderer lives in Python state that undo cannot see - so dropping it
+# on delete meant undo brought the object back with no splats attached. They
+# are parked here instead and re-attached the moment the handle reappears.
+# Bounded, because each one holds its full splat data on the GPU.
+TRASH = []
+TRASH_MAX = 4
 
 
 def draw_params(scene):
@@ -39,12 +47,57 @@ def draw_params(scene):
         "view_transform": scene.view_settings.view_transform,
         "pc_gaussian": scene.fgs_pc_gaussian,
         "sh_quality": scene.fgs_sh_quality,
+        "cull_frustum": getattr(scene, "fgs_cull_frustum", False),
+        "adaptive_sort": getattr(scene, "fgs_adaptive_sort", True),
         "wave_phase": WAVE["phase"],
         "wave_r": WAVE["r"],
         "wave_pr": WAVE["pr"],
         "wave_c": WAVE["c"],
         "wave_soft": WAVE["soft"],
     }
+
+
+# Camera-motion tracking for "Point Cloud While Moving". Splats are expensive
+# to draw and sort; points are not. Detecting motion here rather than hooking
+# navigation operators means it works for every way of moving the view -
+# orbit, pan, walk, fly, a dragged timeline, an animated camera.
+_MOTION = {"mv": None, "t": 0.0, "moving": False}
+MOVE_SETTLE = 1.0          # seconds of stillness before splats return
+
+
+def _settle_tick():
+    """One-shot: nudge a redraw once the camera has been still long enough.
+
+    Without it the viewport would sit showing points indefinitely, because
+    Blender only redraws when something asks it to - and 'nothing happened
+    for a second' is not an event."""
+    import time
+    if time.perf_counter() - _MOTION["t"] >= MOVE_SETTLE:
+        _MOTION["moving"] = False
+        redraw_all()
+        return None                     # stop the timer
+    return 0.1                          # check again shortly
+
+
+def camera_moving(rv3d):
+    """True while the view is changing, and for MOVE_SETTLE seconds after."""
+    import time
+    now = time.perf_counter()
+    try:
+        mv = tuple(rv3d.view_matrix[i][j] for i in range(4) for j in range(4))
+    except Exception:
+        return False
+    if _MOTION["mv"] is None or mv != _MOTION["mv"]:
+        _MOTION["mv"] = mv
+        _MOTION["t"] = now
+        if not _MOTION["moving"]:
+            _MOTION["moving"] = True
+        if not bpy.app.timers.is_registered(_settle_tick):
+            bpy.app.timers.register(_settle_tick, first_interval=MOVE_SETTLE)
+        return True
+    if _MOTION["moving"] and now - _MOTION["t"] >= MOVE_SETTLE:
+        _MOTION["moving"] = False
+    return _MOTION["moving"]
 
 
 def renderer_visible(r, space=None):
@@ -153,24 +206,7 @@ def _draw_callback():
     params = draw_params(bpy.context.scene)
     params["view_pos"] = rv3d.view_matrix.inverted().translation
     vp = rv3d.window_matrix @ rv3d.view_matrix
-
-    # Fast preview while the viewport is in Solid/Wireframe shading. That is
-    # the mode you navigate and block out in, and nothing there depends on
-    # exact splat colour - so trade fidelity for framerate on three axes at
-    # once: draw a fraction of the splats, drop the per-vertex spherical
-    # harmonic texture fetches, and stop re-sorting on every single redraw.
-    # Material Preview and Rendered are left at full quality, since those are
-    # the modes you actually judge the image in.
     sc_ = bpy.context.scene
-    if getattr(sc_, "fgs_solid_fast", False):
-        space_ = getattr(bpy.context, "space_data", None)
-        shading = getattr(getattr(space_, "shading", None), "type", None)
-        if shading in {'SOLID', 'WIREFRAME'}:
-            frac = float(getattr(sc_, "fgs_solid_density", 25.0))
-            params["density"] = max(1.0, params["density"] * frac / 100.0)
-            params["sh_quality"] = 'OFF'
-            params["use_sh"] = False
-            params["hq_sort"] = False
 
     # The reveal targets ONE model (the one just imported). Everyone else gets
     # the wave uniforms disabled so already-loaded models keep drawing
@@ -198,10 +234,35 @@ def _draw_callback():
 
     ordered = sorted(live, key=_depth)   # ascending z = farthest first
 
+    # Per-model settings: each model can carry its own display mode, density,
+    # size and SH quality. Resolved here so the sort path below can tell
+    # whether the models still share parameters.
+    # Points while the view moves: decided once per draw, applied both to the
+    # shared fast path below and to each model's own parameters, so per-model
+    # settings cannot put splats back mid-motion.
+    force_points = (getattr(sc_, "fgs_points_moving", False)
+                    and camera_moving(rv3d))
+    if force_points:
+        params = dict(params)
+        params["mode"] = 'POINTS'
+
+    per = None
+    if getattr(sc_, "fgs_per_model", False):
+        try:
+            from . import permodel
+            per = permodel
+        except Exception as e:
+            print("[SplatBake] per-model settings unavailable:", e)
+
     # Several models that all draw as splats need one global depth order,
     # otherwise a small model inside a big one sorts wholly in front/behind.
+    # That single pass shares one set of parameters, so it is only valid while
+    # every model resolves to the same ones.
     if (len(ordered) > 1 and params.get("mode") == "SPLAT"
-            and WAVE["phase"] == 0):
+            and WAVE["phase"] == 0
+            and (per is None or per.uniform(ordered))):
+        if per is not None:
+            params = per.params_for(ordered[0], params)
         try:
             if _draw_multi(region, rv3d, params, ordered, vp):
                 return
@@ -213,6 +274,11 @@ def _draw_callback():
             if not r.visible_in_frustum(vp):
                 continue
             p = params if (quiet is None or r is WAVE["target"]) else quiet
+            if per is not None:
+                p = per.params_for(r, p)
+                if force_points:
+                    p = dict(p)
+                    p["mode"] = 'POINTS'
             r.draw(region, rv3d, p)
         except Exception as e:
             print("[SplatBake] draw error:", e)
@@ -279,13 +345,23 @@ def _remove_box(r):
             pass
 
 
-def remove_renderer(r):
+def remove_renderer(r, recycle=True, keep_box=False):
+    """Drop a model.
+
+    keep_box=True detaches the renderer but LEAVES the handle Empty in the
+    scene. Reloading a model at a different detail level needs that: it
+    replaces the splats behind an existing handle, and deleting the Empty
+    would invalidate the very object the reload reads its recipe from.
+    """
     global ACTIVE
     if WAVE.get("target") is r:
         stop_wave()
     if r in RENDERERS:
         RENDERERS.remove(r)
-    _remove_box(r)
+    if recycle:
+        _trash(r)          # so Ctrl+Z can bring the splats back with the Empty
+    if not keep_box:
+        _remove_box(r)
     DELETE_HISTORY[:] = [(rr, sid) for (rr, sid) in DELETE_HISTORY if rr is not r]
     if ACTIVE is r:
         ACTIVE = RENDERERS[-1] if RENDERERS else None
@@ -296,6 +372,7 @@ def remove_renderer(r):
 def clear_all():
     """Remove every instance, its box, and the draw handler."""
     global RENDERERS, DELETE_HISTORY, ACTIVE
+    TRASH.clear()
     stop_wave()
     remove_handle()
     for r in RENDERERS:
@@ -553,8 +630,12 @@ def _watch_box(scene, depsgraph):
         return
     survivors = [r for r in RENDERERS
                  if bpy.data.objects.get(r.box_name) is not None]
+    recovered = recover_orphans()
     if len(survivors) != len(RENDERERS):
         global ACTIVE
+        for r in RENDERERS:
+            if r not in survivors:
+                _trash(r)
         RENDERERS[:] = survivors
         if WAVE.get("target") is not None and WAVE["target"] not in RENDERERS:
             stop_wave()
@@ -563,6 +644,49 @@ def _watch_box(scene, depsgraph):
         if not RENDERERS:
             remove_handle()
         redraw_all()
+    elif recovered:
+        redraw_all()
+
+
+def _trash(r):
+    """Park a removed model so undo can bring it back instantly."""
+    name = getattr(r, "box_name", None)
+    if not name:
+        return
+    TRASH[:] = [(n, rr) for (n, rr) in TRASH if n != name]
+    TRASH.append((name, r))
+    while len(TRASH) > TRASH_MAX:
+        TRASH.pop(0)
+
+
+def recover_orphans():
+    """Re-attach any parked model whose handle Empty has come back.
+
+    This is what makes Ctrl+Z work after deleting a whole model: undo restores
+    the Empty, and the renderer that belongs to it is still sitting in TRASH
+    with its GPU buffers intact, so it reappears immediately instead of having
+    to be re-read from disk.
+    """
+    if not TRASH:
+        return False
+    live = {r.box_name for r in RENDERERS}
+    back = []
+    for name, r in list(TRASH):
+        if name in live:
+            TRASH.remove((name, r))
+            continue
+        if bpy.data.objects.get(name) is not None:
+            TRASH.remove((name, r))
+            RENDERERS.append(r)
+            r._force = True
+            back.append(r)
+    if back:
+        global ACTIVE
+        if ACTIVE is None:
+            ACTIVE = back[-1]
+        add_handle()
+        print(f"[SplatBake] restored {len(back)} model(s) after undo")
+    return bool(back)
 
 
 def register():

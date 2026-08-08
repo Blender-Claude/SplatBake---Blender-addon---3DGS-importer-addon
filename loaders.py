@@ -153,9 +153,13 @@ def load_any(filepath, want_sh=False, lod='FULL', budget=0):
         from . import sog
         return sog.load_streamed(filepath, want_sh=want_sh, detail=lod,
                                  budget=budget)
-    if low.endswith(".sog") or base == "meta.json" or os.path.isdir(filepath):
+    if (low.endswith(".sog") or low.endswith(".zip") or base == "meta.json"
+            or base == "lod-meta.json" or os.path.isdir(filepath)):
         from . import sog
-        return sog.load_sog(filepath, want_sh=want_sh)
+        # detail/budget must travel: pointing at a FOLDER is the normal way to
+        # open a streamed scene, and that path resolves to load_streamed too.
+        return sog.load_sog(filepath, want_sh=want_sh, detail=lod,
+                            budget=budget)
     return load_ply(filepath, want_sh=want_sh)
 
 

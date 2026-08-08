@@ -55,16 +55,14 @@ The panel appears in the 3D viewport sidebar (press **N**) under the
 2. Click the model to select it, then move it with Blender's own tools —
    `G` / `R` / `S` — exactly as you would any other object. `Ctrl+C` /
    `Ctrl+V` copy and paste it, and `H` / `Alt+H` hide and unhide it.
-3. Press **Max Detail** if you want maximum viewport crispness. 
-(Tip: Use pointcloud while in viewport to enhance the perfomence when setting up the scene)
-   3.1 Use the AA composition for "natural" true colors. (Removes whitning/ noize in GS object).     
+3. Press **Max Detail** if you want maximum viewport crispness.
 4. Pick a bake:
-   - **Bake Discs** (_Recommended_) — one soft gaussian disc per splat. Closest to the
+   - **Bake Discs** — one soft gaussian disc per splat. Closest to the
      captured look. Renders in Cycles and EEVEE with reflections, depth of
      field and motion blur.
-   - **Bake Solid Surface** (WIP) — one watertight mesh, UV-unwrapped and textured.
+   - **Bake Solid Surface** — one watertight mesh, UV-unwrapped and textured.
      Lit by your scene, sculptable, retopologisable, and exportable.
-7. **F12.**
+5. **F12.**
 
 If you only want an image and not geometry, **Snapshot Still** captures the
 live viewport (splats included) at render resolution — the fastest route to a
@@ -101,14 +99,56 @@ it as a loose image file next to the exported model.
   higher-order SH preserved. SOG is lossy by design — positions are 16-bit,
   orientations 8-bit per component (well under 1° of error), and scales and
   colours are codebook-quantised.
-- **Streamed / LOD SOG** (`lod-meta.json` plus `0_0/`, `1_0/` … chunk folders)
-  — unzip the download and import its `lod-meta.json`, or point the importer at
-  the containing folder. The levels are *additive*: level 0 is the finest and
-  each higher index coarser, so the whole scene is every level stacked.
-  **Streamed SOG Detail** chooses how many to stack — Full, Medium (drop the
-  finest, about half the splats) or Coarse (a fast preview). Chunks are thinned
-  to your Max Splats budget as they load, so a scene larger than memory still
-  opens.
+- **Streamed / LOD SOG** — import the **`.zip` straight from the download**,
+  or unzip it and point the importer at the **folder**; either way it finds
+  the manifest itself, including one level down inside a wrapper folder. You
+  can still pick `lod-meta.json` directly.
+
+  Two things make these scenes different from a plain `.sog`:
+
+  **Every sub-scene is loaded.** A streamed export is a folder of sub-scenes
+  plus a manifest saying how to combine them. Besides the LOD chunks, the
+  manifest may name an `environment` — a separate sky and far backdrop stored
+  outside every level, small in count and enormous in area (on a real capture,
+  77,223 splats carrying 99% of the scene's visual area). That is always
+  loaded in full, whatever detail level you pick. As a safety net, **any other
+  sub-scene folder found beside the manifest is loaded too**, even if the
+  manifest never names it — so an unfamiliar key cannot silently cost you a
+  third of a scene.
+
+  **The levels.** Most surfaces are stored at *every* level, so drawing them
+  all paints the same geometry two or three times, while a few thousand giant
+  splats exist only at the coarse levels. **Streamed SOG Detail** therefore
+  defaults to *Complete scene*: level 0 in full, plus only the coarser splats
+  covering ground it does not. *Foreground only* is lighter; *Coarse* is a
+  quick preview; *Every level stacked* is the naive reading, kept for
+  comparison. **Reload at Detail Level** switches between them without
+  re-importing.
+
+## Loading a large scene
+
+Big streamed captures can hold far more splats than a GPU comfortably holds,
+so **Max Splats to Load** (default 4,000,000) caps what is kept. Anything over
+the cap is dropped by opacity importance — solid structure first, haze last —
+and the importer now warns you when the cap has bitten.
+
+Rough memory cost per splat: **~60 bytes** without spherical harmonics,
+**~240 bytes** with full SH. So 4M splats is roughly 0.25 GB plain or 1 GB
+with SH, and a 9M-splat scene wants about 2.2 GB with SH.
+
+If a scene reports being capped, the options in order of preference:
+
+1. **Raise Max Splats** to just above the scene's real count if the memory
+   above fits your GPU. This is the only option that keeps everything.
+2. **Turn off spherical harmonics** at import — roughly a 4× memory saving,
+   at the cost of view-dependent colour. Often the better trade on a huge
+   scene: more geometry beats shinier geometry.
+3. **Trim Outliers** at 0.1% to drop stray floaters.
+4. Leave the cap and accept the thinning — it is opacity-weighted, so it
+   degrades gracefully rather than punching holes.
+
+For smooth navigation once loaded, switch the display to **Point Cloud** and
+lower **Density**; neither affects a bake or a render.
 
 ## The two bakes, in more detail
 
@@ -191,19 +231,15 @@ Keep the added lamps soft.
 
 ## Viewport tips
 
-- **Fast Solid-Mode Preview** (on by default) trades fidelity for framerate
-  while shading is *Solid* or *Wireframe* — the modes you navigate in. It draws
-  a fraction of the splats (**Solid Detail**, 25% by default), skips
-  view-dependent colour, and re-sorts less often. *Material Preview* and
-  *Rendered* stay at full quality.
+- **To navigate a heavy scene**, switch the display to **Point Cloud** and drop
+  **Density**. Both are visible controls you set deliberately, and with
+  *Per-Model Settings* on you can do it to one model while the rest stay full
+  quality. Switch back to Splats when you want to look at it properly —
+  nothing is hidden behind a shading mode.
 - **Max Detail** locks every setting to source-viewer parity for maximum
   crispness: reference kernel, de-spike off (thin anisotropic splats carry
   edges, wires and hair — clamping them rounds fine detail off), AA
-  compensation off, full size cap, per-frame sort, full SH. It also switches
-  **Fast Solid-Mode Preview off**, since that preview would otherwise override
-  those settings the moment you were in Solid shading. Re-tick it whenever you
-  want speed back — the Solid Detail slider keeps its value and takes over
-  again immediately.
+  compensation off, full size cap, per-frame sort, full SH, 100% density.
 - **Hide / unhide works natively** — `H`, `Alt+H`, the outliner eye and monitor
   icons, hidden or excluded collections and local view all hide the splats along
   with their handle.
@@ -219,6 +255,123 @@ Keep the added lamps soft.
   selects what it made, so `G` moves it straight away. With no splat selected
   (or an empty splat clipboard) both keys fall through to Blender's own
   object copy and paste.
+
+## Per-model settings
+
+By default every model shares one set of display settings. Tick **Per-Model
+Settings** and each carries its own instead — so one splat can sit in the
+scene as a point cloud while another stays full gaussian, each at whatever
+density, splat size, size cap, opacity cutoff and SH quality suits it.
+
+Switching the tickbox on copies the current settings onto every model first,
+so nothing jumps: you start from exactly what you were looking at and diverge
+from there. Select a model to edit it, and **Apply to All Models** pushes the
+active model's settings back out to the rest.
+
+The settings live on each handle Empty as real Blender properties, so they are
+covered by undo and saved in the `.blend` like anything else. The colour grade
+and view transform stay global, since those describe the scene rather than a
+model.
+
+One trade-off worth knowing: several splat models are normally depth-sorted
+together in a single pass, which is what keeps a small model correctly
+interleaved inside a big one. That pass shares one set of parameters, so while
+models genuinely differ they are drawn separately and sort per model instead.
+Identical settings — including right after seeding or Apply to All — keep the
+combined pass.
+
+## Undo and splat deletion
+
+**Deleting a whole model** — delete its handle Empty and `Ctrl+Z` brings both
+the Empty and its splats back. The renderer is parked in a small recycle bin
+rather than discarded, so the model reappears instantly instead of being
+re-read from disk. The bin holds the last few deletions; older ones are
+released, and a `.blend` reopen restores from the source file instead.
+
+**Deleted splats** inside a model can be brought back three ways:
+
+- **`Z`** while still in delete mode — takes back the last splat, one at a time.
+- **`Ctrl+Z`** after leaving delete mode — undoes the whole erasing session as
+  one step, like any other Blender edit.
+- **Restore All Splats** in the panel.
+
+Why a whole session rather than per click: the mask is compressed and written
+into the `.blend` on each undo step, which would stutter on a million-splat
+model if it happened on every click. One step per session also matches how
+people actually undo — "take back that bit of erasing", not "take back that
+one splat". Use `Z` inside the session for fine-grained undo.
+
+## View-dependent colour (SH)
+
+Spherical harmonics make a splat's colour shift with viewing angle. The **SH**
+dropdown trades that detail for speed — *Full* (15 coefficients), *Medium*
+(8), *Low* (3) or *Off* — and changing it rebuilds the SH texture at the
+smaller size, so it saves memory and bandwidth as well as shader work.
+
+**Not every file has SH.** Plenty of captures ship base colour only: a `.ply`
+with no `f_rest_*` properties, or a SOG whose `meta.json` has no `shN` block.
+The dropdown is greyed out with a note when the loaded models carry none —
+there is nothing to reduce, and the setting genuinely does nothing.
+
+If your file does have SH and you want the speed, *Low* keeps most of the
+directional shading for a fifth of the data.
+
+## Point Cloud While Moving
+
+The most direct way to keep navigation fluid: tick **Point Cloud While
+Moving** and the viewport drops to points the instant the view starts
+changing, returning to splats about a second after it stops. Points skip the
+gaussian shading entirely, so the cost is a fraction of a splat draw.
+
+It watches the view matrix rather than hooking navigation operators, so it
+covers every way of moving — orbit, pan, zoom, walk, fly, an animated camera,
+even scrubbing the timeline.
+
+**Navigation** (just above Frame) starts Blender's walk view without hunting
+through menus: `W A S D` to move, mouse to look, `Q`/`E` for down and up,
+`Shift` to go faster, `Tab` for gravity. Left-click or `Enter` to finish,
+`Escape` to cancel and jump back.
+
+## Adaptive Depth Sort
+
+Splats must be drawn back-to-front to blend correctly, and reordering millions
+of them is the dominant cost of moving the camera — measured at **1.6 seconds**
+for 9.35M splats, against under 0.3 for everything else combined.
+
+**Adaptive Depth Sort** (on by default) sorts into 256 depth buckets while the
+view is moving — about **14× faster** — and runs the exact sort the moment the
+camera stops. So an approximate blend order only ever exists while you are
+actively moving, and whatever you settle on looking at is always correctly
+sorted.
+
+The buckets are spaced **logarithmically in distance**, which makes the depth
+error a roughly constant fraction of distance rather than a constant number of
+units. Measured on a 500-unit scene: about 1 unit of error in the near field,
+where splats are large on screen and overlap heavily, rising to 7 in the far
+field where it cannot be seen. Uniform buckets would spread that error evenly
+and ruin the near field; 1/d spacing overcorrects and leaves the distance badly
+ordered.
+
+## Cull Off-Screen Splats (experimental)
+
+While you navigate, the dominant cost is not the GPU — it is the CPU depth
+sort, which has to reorder every splat back-to-front whenever the camera
+moves. Measured on a 9.35M-splat scene: the sort takes **1.7 seconds**, while
+projection, quantisation and index building together take under 0.3.
+
+That sort scales worse than linearly, so removing splats *before* it pays off
+handsomely. Ticking **Cull Off-Screen Splats** drops everything outside the
+view frustum first — measured at **3.1× faster overall** including the cost of
+the test itself, and considerably more when you are inside a scene looking one
+way.
+
+Nothing you can see is removed. Each splat's own radius is allowed for, so a
+large background splat whose centre is off screen still survives — a captured
+sky is often a handful of splats hundreds of units across, and culling those
+by centre alone would make the backdrop flicker at the frame edge.
+
+It is off by default while it is experimental. It affects the viewport only,
+never a bake or a render.
 
 ## A note on floaters
 
@@ -236,6 +389,7 @@ you want the strays gone from the data as well.
 |---|---|
 | `loaders.py` | PLY / `.splat` parsing, SH extraction, trim, subsample |
 | `sog.py` | SOG v2 reader — bundled, unbundled, streamed |
+| `lod.py` | streamed-SOG level merging (self-contained, tunable) |
 | `sh.py` | spherical-harmonic evaluation |
 | `shaders.py` | GLSL sources and the shader builder |
 | `renderer.py` | per-model GPU buffers, depth sort, draw |
@@ -244,11 +398,13 @@ you want the strays gone from the data as well.
 | `lighting.py` | scene-lit bake material (self-contained) |
 | `uvtools.py` | UV unwrap and colour-to-texture rasteriser (self-contained) |
 | `persist.py` | reload recipes, so models survive save/reopen (self-contained) |
+| `permodel.py` | optional per-model display settings (self-contained) |
 | `operators.py` | import, bake, snapshot, edit operators |
 | `ui.py` | the N-panel and scene properties |
 
-`lighting.py`, `uvtools.py` and `persist.py` are deliberately standalone, so
-the optional features can change without touching the render path.
+`lighting.py`, `uvtools.py`, `persist.py` and `permodel.py` are deliberately
+standalone, so the optional features can change without touching the render
+path.
 
 ## Known limitations
 
@@ -287,8 +443,10 @@ against real files, but the pixel read goes through Blender's image system,
 which varies by build. If a `.sog` imports as garbage geometry, this is the
 first thing to suspect — please report it with your Blender version.
 
-**Streamed SOG does not stream.** There is no camera-distance loading in
-Blender, so the levels you choose are simply stacked at import.
+**Streamed SOG does not stream.** A web viewer swaps LOD levels per region as
+the camera moves; Blender has no equivalent, so the levels are merged once at
+import instead. The merge is in `lod.py` on its own, so the strategy can be
+changed without touching the reader or the renderer.
 
 **Baked discs are frozen.** A disc bake captures the model's transform at bake
 time; move the splats afterwards and the bake stays where it was. Re-bake.

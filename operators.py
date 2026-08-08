@@ -33,14 +33,19 @@ def _area_under(context, event):
 
 class FGS_OT_load(Operator, ImportHelper):
     bl_idname = "fgs.load_splat"
-    bl_label = "Load Gaussian Splat (.ply / .splat / .sog)"
+    bl_label = "Load Gaussian Splat (.ply / .splat / .sog / .zip)"
     bl_options = {"REGISTER"}
     filename_ext = ".ply"
     filter_glob: StringProperty(
-        default="*.ply;*.splat;*.sog;*.json", options={"HIDDEN"})
+        default="*.ply;*.splat;*.sog;*.json;*.zip", options={"HIDDEN"})
     max_points: IntProperty(
-        name="Max Splats to Load", default=4000000, min=0,
-        description="Memory budget: how many splats to hold on the GPU")
+        name="Max Splats to Load", default=0, min=0,
+        description="Memory budget: how many splats to hold on the GPU. "
+                    "Splats over the limit are dropped by opacity importance. "
+                    "Rough cost per splat: ~60 bytes without spherical "
+                    "harmonics, ~240 bytes with full SH - so 4M splats is "
+                    "about 0.25 GB plain, or 1 GB with SH. Raise it on a "
+                    "large scene if your GPU has the memory. 0 (the default) means no limit - load everything the file contains")
     weighted: BoolProperty(
         name="Keep Solid Splats", default=True,
         description="When subsampling, prefer high-opacity splats")
@@ -49,17 +54,25 @@ class FGS_OT_load(Operator, ImportHelper):
         description="Crop this percentile off each axis to drop far floaters")
     lod: bpy.props.EnumProperty(
         name="Streamed SOG Detail", default='FULL',
-        description="For streamed / LOD SOG scenes (lod-meta.json) only. The "
-                    "levels are additive - level 0 is the finest and each "
-                    "higher one is coarser - so the full scene is every level "
-                    "stacked together",
+        description="For streamed / LOD SOG scenes (lod-meta.json) only. Most "
+                    "surfaces are stored at every level, but the sky and far "
+                    "backdrop exist ONLY as giant splats at the coarse "
+                    "levels - so neither stacking everything nor taking a "
+                    "single level is right. The default merges them properly",
         items=[
-            ('FULL', "Full (all levels)",
-             "Every chunk: the complete scene. Heaviest"),
-            ('MEDIUM', "Medium (drop finest)",
-             "Skip the finest level - roughly half the splats"),
+            ('FULL', "Complete scene (recommended)",
+             "The finest level in full, plus only those coarser splats "
+             "covering ground it does not - which is where the sky and far "
+             "backdrop live. The whole scene with the least overdraw"),
+            ('FAST', "Foreground only (fast)",
+             "The finest level alone. Lighter, but the background is stored "
+             "as a few giant splats at the coarser levels, so it goes missing"),
             ('COARSE', "Coarse (preview)",
-             "Coarsest level only - fastest way to check a scene"),
+             "The coarsest level alone - fastest way to check a scene"),
+            ('ALL', "Every level stacked (heaviest)",
+             "All levels including the redundant ones, which paints most "
+             "surfaces two or three times over. Complete, but heavier and "
+             "hazier than the recommended merge"),
         ])
     upright: BoolProperty(
         name="Rotate Upright (Y+ to Z+)", default=True,
@@ -200,8 +213,18 @@ class FGS_OT_load(Operator, ImportHelper):
         state.tag_redraw(context)
         wm.progress_end()
         print(f"[SplatBake] ready in {_t.perf_counter()-_t0:.1f}s total")
-        self.report({"INFO"}, f"Loaded {len(data['xyz'])} splats "
-                              f"({len(state.RENDERERS)} in scene)")
+        n_final = len(data["xyz"])
+        # Thinning to the Max Splats budget is easy to miss - it only printed
+        # to the console - and on a big streamed scene it can discard more
+        # than half the splats. Say so where the user will actually see it.
+        if self.max_points > 0 and n_final >= self.max_points:
+            self.report({'WARNING'},
+                        f"Loaded {n_final:,} splats - capped by Max Splats. "
+                        f"Raise it to keep more detail, or turn off "
+                        f"spherical harmonics to fit more in memory")
+        else:
+            self.report({"INFO"}, f"Loaded {n_final:,} splats "
+                                  f"({len(state.RENDERERS)} in scene)")
         return {"FINISHED"}
 
 
@@ -395,9 +418,25 @@ class FGS_OT_select_splat(Operator):
     bl_description = ("Click a model to select its handle, then use Blender's "
                      "native G / R / S (and X/Y/Z) to transform it")
 
+    def _commit(self, context):
+        """Write the masks into Blender data and add ONE undo step for the
+        whole session. Doing this per click would mean a compress-and-store
+        pass on every splat, which stutters on million-splat models; one step
+        per session also matches how people actually undo - 'take back that
+        bit of erasing', not 'take back that one splat'."""
+        if not getattr(self, "_dirty", False):
+            return
+        self._dirty = False
+        try:
+            from . import persist
+            persist.push_undo("Delete Splats")
+        except Exception as e:
+            print("[SplatBake] delete undo step failed:", e)
+
     def modal(self, context, event):
         if not state.RENDERERS:
             context.workspace.status_text_set(None)
+            self._commit(context)
             return {'CANCELLED'}
         if event.type in {'ESC', 'RIGHTMOUSE'} and event.value == 'PRESS':
             context.workspace.status_text_set(None)
@@ -447,6 +486,7 @@ class FGS_OT_move_splat(Operator):
             return {'CANCELLED'}
         if event.type in {'ESC', 'RIGHTMOUSE'} and event.value == 'PRESS':
             context.workspace.status_text_set(None)
+            self._commit(context)
             return {'FINISHED'}
         if not self._drag and (
                 event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE',
@@ -545,9 +585,10 @@ class FGS_OT_delete_mode(Operator):
             region, rv3d = _area_under(context, event)
             if region is None:
                 return {'RUNNING_MODAL'}
-            state.delete_under_cursor(region, rv3d,
-                                      event.mouse_x - region.x,
-                                      event.mouse_y - region.y)
+            if state.delete_under_cursor(region, rv3d,
+                                         event.mouse_x - region.x,
+                                         event.mouse_y - region.y):
+                self._dirty = True
             state.tag_redraw(context)
             return {'RUNNING_MODAL'}
         return {'RUNNING_MODAL'}
@@ -556,10 +597,20 @@ class FGS_OT_delete_mode(Operator):
         if not state.RENDERERS:
             self.report({'WARNING'}, "Load a splat first")
             return {'CANCELLED'}
+        self._dirty = False
         context.window_manager.modal_handler_add(self)
         context.workspace.status_text_set(
-            "LMB: delete splat    Z: undo    MMB / wheel: navigate    ESC / RMB: finish")
+            "LMB: delete splat    Z: undo one    MMB / wheel: navigate    "
+            "ESC / RMB: finish (then Ctrl+Z undoes the session)")
         return {'RUNNING_MODAL'}
+
+
+def _commit_masks(message):
+    try:
+        from . import persist
+        persist.push_undo(message)
+    except Exception as e:
+        print("[SplatBake] undo step failed:", e)
 
 
 class FGS_OT_undo_delete(Operator):
@@ -568,6 +619,7 @@ class FGS_OT_undo_delete(Operator):
 
     def execute(self, context):
         state.undo_delete()
+        _commit_masks("Undo Splat Delete")
         state.tag_redraw(context)
         return {'FINISHED'}
 
@@ -578,6 +630,7 @@ class FGS_OT_restore(Operator):
 
     def execute(self, context):
         state.restore_all()
+        _commit_masks("Restore Splats")
         state.tag_redraw(context)
         return {'FINISHED'}
 
@@ -1878,6 +1931,120 @@ class FGS_OT_test_splat(Operator):
         return {'FINISHED'}
 
 
+class FGS_OT_walk(Operator):
+    bl_idname = "fgs.walk_navigation"
+    bl_label = "Navigation"
+    bl_description = ("Blender walk view - W A S D to move, mouse to look, "
+                      "Q and E for down and up, Shift to go faster, Tab to "
+                      "toggle gravity. Left-click or Enter to finish, Escape "
+                      "to cancel and jump back")
+
+    def execute(self, context):
+        # walk() is modal and polls for a 3D viewport's WINDOW region. Run from
+        # the N-panel the active region is the sidebar, so it must be
+        # overridden onto the viewport itself or the operator refuses to start.
+        win = area = region = None
+        for w in context.window_manager.windows:
+            for a in w.screen.areas:
+                if a.type != 'VIEW_3D':
+                    continue
+                for rg in a.regions:
+                    if rg.type == 'WINDOW':
+                        win, area, region = w, a, rg
+                        break
+                if region:
+                    break
+            if region:
+                break
+        if region is None:
+            self.report({'WARNING'}, "No 3D viewport to walk in")
+            return {'CANCELLED'}
+        try:
+            with context.temp_override(window=win, area=area, region=region):
+                bpy.ops.view3d.walk('INVOKE_DEFAULT')
+        except Exception as e:
+            self.report({'ERROR'}, f"Could not start walk navigation: {e}")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class FGS_OT_apply_display_to_all(Operator):
+    bl_idname = "fgs.apply_display_to_all"
+    bl_label = "Apply Display Settings to All Models"
+    bl_options = {'REGISTER', 'UNDO'}
+    bl_description = ("Copy the active model's display settings onto every "
+                      "other loaded model")
+
+    def execute(self, context):
+        r = state.active_renderer(context)
+        if r is None:
+            self.report({'WARNING'}, "No active model")
+            return {'CANCELLED'}
+        try:
+            from . import permodel
+            n = permodel.apply_to_all(context.scene, state.RENDERERS, r)
+        except Exception as e:
+            self.report({'ERROR'}, f"Could not apply: {e}")
+            return {'CANCELLED'}
+        state.tag_redraw(context)
+        self.report({'INFO'},
+                    f"Applied to {n} other model{'s' if n != 1 else ''}")
+        return {'FINISHED'}
+
+
+class FGS_OT_reload_lod(Operator):
+    bl_idname = "fgs.reload_lod"
+    bl_label = "Reload at Detail Level"
+    bl_options = {'REGISTER'}
+    bl_description = ("Re-read the active streamed-SOG model at a different "
+                      "detail level, in place, without re-importing")
+    lod: bpy.props.EnumProperty(
+        name="Detail", default='FULL',
+        items=[
+            ('FULL', "Complete scene (recommended)",
+             "The finest level in full, plus only those coarser splats "
+             "covering ground it does not - which is where the sky and far "
+             "backdrop live. The whole scene with the least overdraw"),
+            ('FAST', "Foreground only (fast)",
+             "The finest level alone. Lighter, but the background is stored "
+             "as a few giant splats at the coarser levels, so it goes missing"),
+            ('COARSE', "Coarse (preview)",
+             "The coarsest level alone - fastest way to check a scene"),
+            ('ALL', "Every level stacked (heaviest)",
+             "All levels including the redundant ones, which paints most "
+             "surfaces two or three times over. Complete, but heavier and "
+             "hazier than the recommended merge"),
+        ])
+
+    def execute(self, context):
+        r = state.active_renderer(context)
+        if r is None:
+            self.report({'WARNING'}, "No active model")
+            return {'CANCELLED'}
+        from . import persist
+        box = bpy.data.objects.get(r.box_name)
+        if box is None or persist.KEY not in box:
+            self.report({'WARNING'}, "This model has no reload recipe")
+            return {'CANCELLED'}
+        rec = dict(box[persist.KEY])
+        rec["lod"] = self.lod
+        box[persist.KEY] = rec
+        # Detach the old splats but KEEP the Empty: it carries the recipe the
+        # reload is about to read, and it is the handle the user has selected.
+        state.remove_renderer(r, recycle=False, keep_box=True)
+        try:
+            new_r = persist._restore_one(box)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.report({'ERROR'}, f"Reload failed: {e}")
+            return {'CANCELLED'}
+        state.set_active(new_r)
+        state.tag_redraw(context)
+        self.report({'INFO'}, f"Reloaded at {self.lod}: {new_r.N:,} splats")
+        return {'FINISHED'}
+
+
 class FGS_OT_best_quality(Operator):
     bl_idname = "fgs.best_quality"
     bl_label = "Max Detail"
@@ -1885,9 +2052,7 @@ class FGS_OT_best_quality(Operator):
                      "maximum crispness: reference kernel, de-spike "
                      "off (thin detail splats keep their sharpness), AA "
                      "compensation off, full-range size cap, per-frame sort, "
-                     "full SH, 100% density, neutral grade. Also switches OFF "
-                     "the fast Solid-mode preview, which would otherwise "
-                     "override these settings while you are in Solid shading")
+                     "full SH, 100% density, neutral grade")
 
     def execute(self, context):
         sc = context.scene
@@ -1903,13 +2068,6 @@ class FGS_OT_best_quality(Operator):
         sc.fgs_density = 100.0
         sc.fgs_lod = False
         sc.fgs_lod_points = False
-        # Safeguard: the fast Solid/Wireframe preview deliberately thins the
-        # splats and drops SH, which would silently override everything set
-        # above the moment you are in Solid shading - "Max Detail" would then
-        # not be max detail at all. Turn it off so this button means what it
-        # says. Re-ticking it later hands control back to the Solid Detail
-        # slider, which is read fresh on every redraw.
-        sc.fgs_solid_fast = False
         sc.fgs_exposure = 1.0
         sc.fgs_saturation = 1.0
         sc.fgs_gamma = 1.0
@@ -1924,12 +2082,13 @@ class FGS_OT_best_quality(Operator):
             pass
         state.tag_redraw(context)
         self.report({'INFO'},
-                    "Max detail applied - fast Solid-mode preview turned off")
+                    "Max detail: source-viewer parity settings applied")
         return {'FINISHED'}
 
 
 classes = (FGS_OT_load, FGS_OT_clear, FGS_OT_reset_transform, FGS_OT_remove_active,
            FGS_OT_duplicate, FGS_OT_copy, FGS_OT_paste, FGS_OT_best_quality,
+           FGS_OT_apply_display_to_all, FGS_OT_walk, FGS_OT_reload_lod,
            FGS_OT_snapshot, FGS_OT_bake, FGS_OT_bake_surface,
            FGS_OT_selftest, FGS_OT_test_splat,
            FGS_OT_click_select, FGS_OT_dolly_cursor,
@@ -1940,7 +2099,7 @@ classes = (FGS_OT_load, FGS_OT_clear, FGS_OT_reset_transform, FGS_OT_remove_acti
 
 def _menu_import(self, context):
     self.layout.operator(FGS_OT_load.bl_idname,
-                         text="Gaussian Splat (.ply / .splat / .sog)")
+                         text="Gaussian Splat (.ply / .splat / .sog / .zip)")
 
 
 # Click-anywhere selection with the NORMAL tools. fgs.click_select returns

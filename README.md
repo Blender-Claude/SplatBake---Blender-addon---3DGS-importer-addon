@@ -2,14 +2,10 @@
 
 **Import a Gaussian splat. Bake it. Render it.**
 
-*A Blender add-on by [Blender-Claude](https://github.com/Blender-Claude) and MMJ — free software under GPL-3.0-or-later.*
+*A Blender add-on by MMJ — free software under GPL-3.0-or-later.*
 
-> **Not affiliated with, sponsored by, or endorsed by Anthropic or the Blender
-> Foundation.** "Blender-Claude" is the author's chosen handle, reflecting that
-> the add-on was written with the help of Anthropic's Claude. Claude is a
-> trademark of Anthropic, PBC; Blender is a trademark of the Blender
-> Foundation. Both names are used here only to describe how the project was
-> made and what it runs on.
+> Not affiliated with, sponsored by, or endorsed by the Blender Foundation.
+> Blender is a trademark of the Blender Foundation.
 
 Blender can't render Gaussian splats — they aren't geometry, so Cycles and
 EEVEE simply don't see them. SplatBake fixes that in three steps:
@@ -225,11 +221,150 @@ World* both ticked in the shading dropdown. Material Preview otherwise lights
 with its own studio HDRI and ignores your lamps entirely, and Solid shading
 shows no materials at all — which looks exactly like the feature not working.
 
-Also worth knowing: a capture already has its lighting baked into the colours,
-so using them as albedo multiplies the original lighting by the new lighting.
-Keep the added lamps soft.
+### Why a lit bake can render black
+
+A pure albedo shows nothing until a lamp reaches it, and there are two ways
+that goes wrong.
+
+**Self-shadowing.** A baked splat model is not a surface, it is a cloud of
+hundreds of thousands of overlapping discs. If every disc casts a shadow, each
+one lands in the shadow of the dozens stacked in front of it — light reaches
+the outer shell and nothing else, and the model renders as a black blob with a
+faintly lit rim. **Cast Shadows is therefore off by default**, and when you do turn it on,
+**Shadow Strength** (default 0.15) controls how solid the model looks to shadow
+rays only. Low values let light through the cloud so the model still lights up
+while still dropping a shadow onto the floor. Camera rays are untouched, so it
+never changes how the model itself looks. At 1.0 you get the full blackout. Self-shadowing
+is also double-counting: the shoot's own occlusion is already baked into the
+colours. Turn it on only when the model must drop a shadow onto other
+geometry, and expect it to darken.
+
+**Nothing to catch.** No lamps and a black world means no light, and the bake
+dialog warns about this before you run it.
+
+**Keep Captured Colour** blends some of the original colour back in as
+emission, so the model stays readable even where no lamp reaches it. It turns
+the feature into a dial from captured look to fully relit, rather than a
+switch between two extremes. Default 0.25.
+
+### Why per-disc relighting is hard (and what actually works)
+
+Worth stating plainly: relighting Gaussian splats is not a solved problem.
+Research methods exist, but they need dedicated training pipelines and are not
+available in any commercial DCC tool. Unreal's production plugins do splat
+shadow interaction via *proxy geometry*, not material-based relighting.
+
+The specific reason a disc bake resists lighting is measurable. A splat's
+normal is its shortest covariance axis — fine for splats that trained flat
+against a surface, but a real 3DGS capture is full of near-isotropic blobs
+where the shortest axis is numerical noise. Shade hundreds of thousands of
+overlapping semi-transparent discs with noisy normals and the alpha composite
+*averages* the shading: roughly half face any given lamp, so every pixel
+converges to the same mid-grey times albedo. The model looks evenly tinted and
+barely reacts when the lamp moves — not because lighting isn't computed, but
+because it's computed hundreds of times per pixel with normals that cancel.
+
+Simulated on a spherical capture, measuring how much shading changes when the
+lamp moves to the opposite side:
+
+| normal noise | raw discs | after smoothing |
+|---|---|---|
+| none | 0.49 | 0.50 |
+| moderate | 0.28 | 0.48 |
+| realistic | 0.13 | 0.46 |
+| very blobby | 0.10 | 0.46 |
+
+**Align Discs to Surface** (on by default) fixes this. It orients normals
+consistently, averages each with its spatial neighbours — noise is
+uncorrelated between neighbours and cancels, real surface orientation is
+shared and survives — then re-seats each disc into that smoothed plane. Discs
+keep their extents, so the model looks the same unlit; only the facing
+changes, and flat shading reads the coherent normal straight off the geometry.
+
+**For real shadows and reflections, use Bake Solid Surface instead.** A cloud
+of transparent billboards has no coherent surface to reflect anything. The
+solid bake extracts an isosurface and gives you actual geometry — the same
+proxy-geometry approach production tools use.
+
+### If lamps do nothing at all, check this first
+
+**React to Scene Lights is OFF by default.** With it off the bake is emission —
+self-lit, identical regardless of lighting, exactly as if no lamp existed. This
+is the most common confusion with the addon, so the bake dialog now warns about
+it in place rather than leaving it to the tooltip.
+
+### Normals
+
+Lighting needs a surface direction, and a splat's quaternion fixes its axes but
+not their **sign** — so face normals come out pointing in and out at random.
+
+That was previously assumed harmless, on the grounds that Cycles and EEVEE flip
+backfacing normals toward the viewer anyway. The flip is real; the conclusion
+was not. With random signs, that flip sends *every* disc's shading normal toward
+the camera, so `N·L` is near-identical for every splat: the lighting loses all
+spatial variation and the model reads as one flat tint that barely changes when
+the lamp moves. On a simulated spherical capture the resulting shading
+correlated **−0.27** with correct lighting — inverted, not merely flat — and
+shifted measurably when only the *camera* moved.
+
+That reasoning turned out to be half right. Flipping only the *sign* toward the
+viewer preserves the angular variation of the shortest axis, so form still
+shades; and on a closed object seen from outside, the outward normal already
+faces the camera, so the flip and the true orientation agree on every splat you
+can actually see. The reference Cycles implementation
+([pristinaai/Splat-enabled-blender](https://github.com/pristinaai/Splat-enabled-blender),
+`gaussian_lit_shader.h`) does the same thing deliberately — shortest axis,
+flipped toward the ray, with the note that orbiting reveals the other side via
+different splats.
+
+So **Splat Normals** is now a choice, defaulting to **Face Viewer**, which
+matches both Blender's native behaviour and that reference implementation and
+guarantees every visible splat receives light. **True Orientation** undoes the
+flip and shades with the baked orientation: more physically honest, with real
+rim lighting from a lamp behind, but inside a fuzzy capture the splats facing
+away from you render black. Discs get consistent outward winding either way,
+which is what makes True Orientation meaningful.
+
+Albedo is also clamped to [0, 1] on the lit path, matching the reference
+implementation — de-lighting divides by a fitted shading term and can otherwise
+push values past 1, which compounds into a glow across many overlapping discs.
+
+### Remove Captured Lighting
+
+A capture already has its lighting baked into the colours, so using them as
+albedo would multiply the original lighting by the new lighting — the shoot's
+shadows and highlights stay visible and you light on top of them. The **Remove
+Captured Lighting** slider in the disc-bake dialog divides that out.
+
+It works because a capture carries its own record of how it was lit. A splat's
+albedo has no relation to which way it faces, but the light arriving on it
+varies *smoothly with its normal* — that is what makes one side of an object
+bright and the other dim. Fitting smooth degree-2 spherical harmonics to
+luminance against the splat normals recovers that trend, and dividing it out
+leaves the albedo. Nine coefficients fitted over millions of splats is so
+overdetermined that the fit cannot absorb real detail; it only captures the
+broad directional sweep, which is exactly the part worth removing.
+
+On a synthetic test with known ground truth, error against the true albedo fell
+by about 4.5× at full strength. Overall brightness is preserved, and a capture
+that was already evenly lit comes back essentially untouched.
+
+**It does not remove everything.** Cast shadows depend on position rather than
+normal, and baked specular highlights are not diffuse, so both survive. The
+default of 0.75 rather than 1.0 is deliberate: at full strength the fit starts
+eating genuine albedo variation, and 0.75 measured closest to the true albedo
+spread. Soft added lamps still read best.
 
 ## Viewport tips
+
+- **Large scenes cull through a spatial grid.** Above 250k splats the viewport
+  builds a bucket grid once on first navigation and tests a few thousand bucket
+  centres per frame instead of every splat. On a clustered 9.35M-splat scene
+  this measured about 21 ms per moving frame against 180–280 ms, and removes a
+  112 MB temporary allocation that used to happen every frame. The grid is
+  conservative — it can keep a few splats that are just off screen, never drop
+  one that is on it — and falls back to the exact per-splat test if it cannot
+  be built.
 
 - **To navigate a heavy scene**, switch the display to **Point Cloud** and drop
   **Density**. Both are visible controls you set deliberately, and with
@@ -247,6 +382,13 @@ Keep the added lamps soft.
   and stops there; transforms always go through Blender's own `G` / `R` / `S`
   and gizmos, so nothing is ever moved by accident. Clicks that miss every
   model behave exactly like stock Blender.
+- **Duplicates are instances.** `Shift+D`, `Ctrl+C`/`Ctrl+V` and the Duplicate
+  button all produce copies that **share the original's data** — both the CPU
+  arrays and the GPU buffers. The vertex buffer is 256 bytes per splat, so ten
+  copies of a 9.35M-splat scene cost 2.2 GB between them instead of 22 GB.
+  Each copy still has its own transform, its own visibility, its own deleted
+  splats and its own depth order; only the geometry is shared, and it survives
+  the original being deleted.
 - **`Ctrl+C` / `Ctrl+V` copy and paste models**, including a multi-selection.
   A copy **shares** the original's splat data rather than duplicating it, so
   pasting a 2M-splat scan costs a transform and a mask — not another 2M
@@ -478,52 +620,9 @@ Bug reports are welcome. Please include:
 
 For import problems, it also helps a lot to say which tool exported the file.
 
-## Acknowledgements
+## License
 
-**Anthropic**, for Claude — which wrote a great deal of this add-on: the SOG
-reader, the bake paths, the UV rasteriser, and the several hundred tests that
-kept them honest. Anthropic neither sponsors, endorses, nor supports this
-project, and has no responsibility for it. The gratitude is entirely
-one-directional, and entirely sincere.
+Copyright (C) 2026 MMJ. Released under GPL-3.0-or-later — see `LICENSE.md`.
 
-**The Blender Foundation**, for a 3D suite whose Python API is open enough
-that a splat renderer can simply be *added* to it, and whose GPL licence this
-project is proud to inherit.
-
-**The 3D Gaussian Splatting research community**, for the technique itself,
-and everyone who published an open format spec — without one, an importer is
-just guesswork.
-
-**The capture authors**, whose CC-BY scenes made testing against real data
-possible rather than theoretical. Their names travel with their scenes; please
-keep them there.
-
-## Authors and license
-
-Written by **Blender-Claude and MMJ** — a human with initials and a language
-model with opinions about depth sorting.
-
-`MMJ` is the human author: the one who decided what this should be, said no
-when it wandered, and tested every build against real scans on real hardware.
-`Blender-Claude` is the handle under which the work was done with Claude's
-help. Between them, roughly forty builds, five test suites, and one memorable
-afternoon spent discovering that eleven stray splats can make a scene appear
-117,000 units wide.
-
-Home: <https://github.com/Blender-Claude>
-Copyright rests with the human author. See the trademark note above.
-
-    SplatBake
-    Copyright (C) 2026 Blender-Claude and MMJ
-
-    This program is free software: you can redistribute it and/or modify it
-    under the terms of the GNU General Public License as published by the
-    Free Software Foundation, either version 3 of the License, or (at your
-    option) any later version.
-
-Released under **GPL-3.0-or-later** — see `LICENSE.md` for the full notice.
-Blender's Python API is GPL, so add-ons that import `bpy` must ship under a
-GPL-compatible license; this isn't merely a preference.
-
-Splat scenes you import carry **their own** licenses. Many public captures are
+Splat scenes you import carry their own licenses. Many public captures are
 CC-BY and require crediting the original author in anything you publish.

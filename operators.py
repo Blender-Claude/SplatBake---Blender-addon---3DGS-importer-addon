@@ -286,7 +286,9 @@ class FGS_OT_duplicate(Operator):
             empty = boxes.spawn_box(context, offset @ src_box.matrix_world.copy(),
                                     context.scene.fgs_show_bbox,
                                     name=src_box.name)
-            r = SplatRenderer(src.source, empty.name, src.rest_inv.copy())
+            # share the donor's GPU buffers: an instance, not a second upload
+            r = SplatRenderer(src.source, empty.name,
+                              src.rest_inv.copy(), share_from=src)
             r.alive = src.alive.copy()
         except Exception as e:
             self.report({'ERROR'}, f"Duplicate failed: {e}")
@@ -343,6 +345,7 @@ class FGS_OT_copy(Operator):
             # Holding the reference also keeps the data alive if the original
             # is deleted before pasting.
             _CLIPBOARD.append({
+                "renderer": r,       # donor for GPU-buffer sharing on paste
                 "source": r.source,
                 "alive": r.alive.copy(),
                 "rest_inv": r.rest_inv.copy(),
@@ -375,8 +378,10 @@ class FGS_OT_paste(Operator):
                 empty = boxes.spawn_box(context, entry["matrix"].copy(),
                                         context.scene.fgs_show_bbox,
                                         name=entry["name"])
+                donor = entry.get("renderer")
                 r = SplatRenderer(entry["source"], empty.name,
-                                  entry["rest_inv"].copy())
+                                  entry["rest_inv"].copy(),
+                                  share_from=donor)
                 r.alive = entry["alive"].copy()
             except Exception as e:
                 self.report({'ERROR'}, f"Paste failed: {e}")
@@ -896,7 +901,8 @@ def _bake_material(name, soft, sc, live_rinv=None, color_img=None):
     return mat
 
 
-def _disc_geometry(centers, quat, scale, aniso, splat_scale):
+def _disc_geometry(centers, quat, scale, aniso, splat_scale, orient_to=None,
+                   align_normal=None):
     """Pure-numpy disc geometry: per-splat quads oriented by the two largest
     covariance axes, sized like the viewport quads. Returns
     (verts (4n,3) local, faces (2n,3), uvs (6n,2))."""
@@ -928,6 +934,61 @@ def _disc_geometry(centers, quat, scale, aniso, splat_scale):
     a1, a2 = order[:, 2], order[:, 1]
     t = R[ni, :, a1] * (scale[ni, a1] * ext)[:, None]
     u = R[ni, :, a2] * (scale[ni, a2] * ext)[:, None]
+
+    # Re-seat each disc into the regularised surface plane (lit bakes only).
+    #
+    # By default a disc spans its own two largest axes, so its facing is set by
+    # that splat's own orientation - and on a real capture those orientations
+    # are noisy enough that shading them averages out to a flat tint. Rebuilding
+    # the disc in the plane PERPENDICULAR to the smoothed normal makes
+    # neighbouring splats share a facing, which is what lets a lamp shade form.
+    #
+    # The disc keeps its two largest extents, so it covers the same area and the
+    # model looks the same unlit; only which way it faces changes. Flat shading
+    # then reads the coherent normal straight off the geometry, with no custom
+    # split normals - which matters, because setting those per loop on millions
+    # of splats through the Python API is far too slow to be usable.
+    if align_normal is not None:
+        N = np.ascontiguousarray(align_normal, np.float32)
+        N = N / np.maximum(np.linalg.norm(N, axis=1, keepdims=True), 1e-8)
+        # Any vector not parallel to N gives a valid in-plane direction. Pick
+        # the world axis N leans on least, so the cross product stays stable.
+        helper = np.zeros((n, 3), np.float32)
+        helper[np.arange(n), np.argmin(np.abs(N), axis=1)] = 1.0
+        e1 = np.cross(N, helper)
+        e1 /= np.maximum(np.linalg.norm(e1, axis=1, keepdims=True), 1e-8)
+        e2 = np.cross(N, e1)
+        len_t = np.linalg.norm(t, axis=1, keepdims=True)
+        len_u = np.linalg.norm(u, axis=1, keepdims=True)
+        t = e1 * len_t
+        u = e2 * len_u
+        # Winding chosen so the face normal is +N, giving the whole model a
+        # consistent outward facing without a second orientation pass.
+        wrong = np.einsum('ij,ij->i', np.cross(t, u), N) < 0.0
+        if wrong.any():
+            u[wrong] = -u[wrong]
+        orient_to = None                    # already oriented, do not re-flip
+
+    # Consistent outward winding, for lit bakes only.
+    #
+    # A splat's quaternion fixes its axes but not their SIGN, so face normals
+    # come out pointing in and out at random. That was assumed harmless on the
+    # grounds that renderers flip backfacing normals toward the viewer - but
+    # that is exactly what breaks it: with random signs, EVERY disc ends up
+    # flipped to face the camera, N.L becomes near-identical across the whole
+    # model, and the lighting collapses to one flat tint with no form.
+    #
+    # Flipping the winding so each normal points away from the model centre
+    # gives neighbouring splats on a surface a shared orientation, which is
+    # what lets a lamp actually shade the form. Negating `u` (rather than `t`)
+    # reverses the cross product; the kernel UVs are radially symmetric, so
+    # the disc's appearance is unaffected.
+    if orient_to is not None:
+        nrm = np.cross(t, u)
+        away = np.einsum('ij,ij->i', nrm, centers - np.asarray(
+            orient_to, np.float32)[None, :]) < 0.0
+        if away.any():
+            u[away] = -u[away]
 
     verts = np.empty((4 * n, 3), np.float32)
     verts[0::4] = centers - t - u
@@ -987,7 +1048,10 @@ def _fast_tri_mesh(name, verts, tris):
 
 
 def _bake_cards(r, context, cap, soft=True, boost=1.0, min_opacity=0.0,
-                sh_mode='BASE', cam_world=None, use_texture=True, lit=False):
+                sh_mode='BASE', cam_world=None, use_texture=True, lit=False,
+                delight=0.0, emission_mix=0.0, cast_shadows=False,
+                normal_mode='CAMERA', shadow_strength=1.0,
+                align_discs=True):
     """Build a renderable mesh for the active model: one gaussian disc per
     splat (2 triangles), sized and soft-clipped exactly like the viewport
     quads. Colour detail depends on sh_mode:
@@ -1044,8 +1108,26 @@ def _bake_cards(r, context, cap, soft=True, boost=1.0, min_opacity=0.0,
                if op_full is not None else np.ones(n, np.float32))
     opacity = np.clip(opacity * float(boost), 0.0, 1.0)
 
+    # Lit bakes need consistently oriented normals; the emission path does not
+    # use normals at all, so it keeps the cheaper unoriented winding.
+    orient_to = None
+    align_normal = None
+    if lit:
+        from .loaders import robust_bounds
+        _lo, _hi = robust_bounds(centers)
+        orient_to = ((_lo + _hi) * 0.5).astype(np.float32)
+        if align_discs:
+            try:
+                from . import lighting as _ln
+                align_normal = _ln.surface_normals(
+                    centers, quat, src["scale"][idx].astype(np.float32))
+                orient_to = None
+            except Exception as e:
+                print("[SplatBake] surface alignment failed:", e)
     verts, faces, uvs = _disc_geometry(centers, quat, src["scale"][idx],
-                                       sc.fgs_despike, sc.fgs_splat_scale)
+                                       sc.fgs_despike, sc.fgs_splat_scale,
+                                       orient_to=orient_to,
+                                       align_normal=align_normal)
     M = np.array(r.model_matrix(), dtype=np.float32)
     vh = np.concatenate([verts, np.ones((4 * n, 1), np.float32)], axis=1)
     world = (vh @ M.T)[:, :3]
@@ -1069,6 +1151,25 @@ def _bake_cards(r, context, cap, soft=True, boost=1.0, min_opacity=0.0,
         col = src["rgb"][idx].astype(np.float32)   # raw: graded in the nodes
     else:
         col = _grade_np(src["rgb"][idx], sc)
+
+    # -- de-lighting (scene-lit bakes only) ----------------------------
+    # Only meaningful when the colour is about to become an ALBEDO. On the
+    # emission path the captured lighting is the point, and removing it would
+    # be destroying the very thing the user asked to reproduce.
+    if lit and float(delight) > 0.0:
+        try:
+            from . import lighting as _lit
+            nrm = _lit.splat_normals(quat, src["scale"][idx].astype(np.float32))
+            col = _lit.delight(col, nrm, float(delight))
+        except Exception as e:
+            print("[SplatBake] de-lighting failed, colours unchanged:", e)
+    if lit:
+        # Albedo, not radiance: clamp before it becomes a texel.
+        try:
+            from . import lighting as _lit2
+            col = _lit2.clamp_albedo(col)
+        except Exception:
+            pass
 
     nm = bpy.data.objects.get(r.box_name)
     nm = (nm.name if nm else "Splat") + "_baked"
@@ -1117,7 +1218,10 @@ def _bake_cards(r, context, cap, soft=True, boost=1.0, min_opacity=0.0,
         from . import lighting
         mesh.materials.append(
             lighting.build_lit_material(nm, soft, color_img,
-                                        atlas_uv=_ATLAS_UV))
+                                        atlas_uv=_ATLAS_UV,
+                                        emission_mix=float(emission_mix),
+                                        normal_mode=normal_mode,
+                                        shadow_strength=float(shadow_strength)))
     else:
         mesh.materials.append(
             _bake_material(nm, soft, sc, live_rinv, color_img))
@@ -1126,7 +1230,7 @@ def _bake_cards(r, context, cap, soft=True, boost=1.0, min_opacity=0.0,
     context.collection.objects.link(obj)
     if lit:
         from . import lighting
-        lighting.prepare_object(obj)
+        lighting.prepare_object(obj, cast_shadows=bool(cast_shadows))
     else:
         try:
             # Emission splats are baked radiance: they must not cast shadows.
@@ -1139,6 +1243,68 @@ def _bake_cards(r, context, cap, soft=True, boost=1.0, min_opacity=0.0,
     obj.select_set(True)
     context.view_layer.objects.active = obj
     return obj, n, mode, (color_img is not None)
+
+
+class FGS_OT_light_setup(Operator):
+    """One click that removes every variable between a lit bake and seeing it.
+
+    Across a lot of debugging, a lit bake that looked broken has turned out to
+    be one of: the render engine set to Cycles on a CPU (never converges), the
+    viewport left in Solid or Material Preview (materials not shown, or lit by
+    a studio HDRI that ignores your lamps), or simply no lamp in the scene.
+    Each is invisible from the render, and each looks exactly like a bug.
+
+    Rather than ask someone to check four things in three editors, set all of
+    them at once and report what changed.
+    """
+    bl_idname = "fgs.light_setup"
+    bl_label = "Set Up Lighting Test"
+    bl_description = ("Switch to EEVEE, add a sun if the scene has no lamp, "
+                      "and set the viewport to Rendered - so a lit bake can "
+                      "actually be seen")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        done = []
+        scn = context.scene
+        try:
+            eng = str(scn.render.engine).upper()
+            if 'EEVEE' not in eng:
+                for name in ('BLENDER_EEVEE_NEXT', 'BLENDER_EEVEE'):
+                    try:
+                        scn.render.engine = name
+                        done.append("engine -> EEVEE")
+                        break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        if not any(o.type == 'LIGHT' for o in scn.objects):
+            try:
+                ld = bpy.data.lights.new("SplatBake Sun", 'SUN')
+                ld.energy = 3.0
+                sun = bpy.data.objects.new("SplatBake Sun", ld)
+                scn.collection.objects.link(sun)
+                sun.rotation_euler = (0.6, 0.0, 0.8)
+                done.append("added a sun")
+            except Exception:
+                pass
+
+        # Rendered shading, in every 3D viewport that is open - the setting is
+        # per-space, so changing only the active one leaves the others wrong.
+        try:
+            for area in context.screen.areas:
+                if area.type == 'VIEW_3D':
+                    for sp in area.spaces:
+                        if sp.type == 'VIEW_3D':
+                            sp.shading.type = 'RENDERED'
+            done.append("viewport -> Rendered")
+        except Exception:
+            pass
+
+        self.report({'INFO'}, "Lighting test: " + (", ".join(done) or "already set"))
+        return {'FINISHED'}
 
 
 class FGS_OT_bake(Operator):
@@ -1202,6 +1368,118 @@ class FGS_OT_bake(Operator):
                     "receives shadows. Off = self-lit, identical to the "
                     "viewport regardless of lighting")
 
+
+    delight: FloatProperty(
+        name="Remove Captured Lighting", default=0.75, min=0.0, max=1.0,
+        subtype='FACTOR',
+        description=(
+            "How much of the lighting baked into the capture to divide out "
+            "before the colours are used as albedo. Without this the original "
+            "lighting is multiplied by the new lighting. Fits smooth degree-2 "
+            "spherical harmonics to luminance against the splat normals and "
+            "removes that trend; cast shadows and baked highlights remain. "
+            "0 = keep the capture's lighting, 1 = remove the full fitted "
+            "trend. Only used when React to Scene Lights is on"))
+    emission_mix: FloatProperty(
+        name="Keep Captured Colour", default=0.15, min=0.0, max=1.0,
+        subtype='FACTOR',
+        description=(
+            "Blend some of the captured colour back in as emission, so the "
+            "model stays visible even where no lamp reaches it. 0 = pure "
+            "albedo (fully relit, and black wherever it is unlit), 1 = the "
+            "original self-lit look with no lighting response. A small amount "
+            "keeps the capture readable while lamps still shape it")) 
+    cast_shadows: BoolProperty(
+        name="Cast Shadows", default=False,
+        description=(
+            "Let the baked discs cast shadows. Off by default: a splat model "
+            "is a cloud of overlapping discs, so with shadows on each disc "
+            "sits in the shadow of the ones in front and the model renders "
+            "almost black with only a lit rim. Turn on only when the model "
+            "must drop a shadow onto other geometry, and expect it to darken"))
+    normal_mode: bpy.props.EnumProperty(
+        name="Splat Normals", default='CAMERA',
+        items=[
+            ('CAMERA', "Face Viewer",
+             "Let the renderer turn each splat's normal toward the camera. "
+             "Every visible splat receives light, so the model never goes "
+             "black. This is Blender's native behaviour and matches the "
+             "reference Cycles splat implementation"),
+            ('TRUE', "True Orientation",
+             "Shade with the orientation baked into the discs, so splats "
+             "facing away from a lamp go dark and a lamp behind the model "
+             "gives a real rim. More physically honest, but inside a fuzzy "
+             "capture the splats facing away from you render black"),
+        ],
+        description="How splat normals are treated when lighting")
+    shadow_strength: FloatProperty(
+        name="Shadow Strength", default=0.15, min=0.0, max=1.0,
+        subtype='FACTOR',
+        description=(
+            "How solid the model looks to shadow rays only. Low values let "
+            "light through the cloud so the model still lights up, while it "
+            "keeps dropping a shadow onto the floor. At 1.0 every disc "
+            "shadows the ones behind it and the model goes almost black. "
+            "Camera rays are unaffected, so this never changes how the model "
+            "itself looks. Only used when Cast Shadows is on"))
+    align_discs: BoolProperty(
+        name="Align Discs to Surface", default=True,
+        description=(
+            "Re-seat each disc into a smoothed surface plane before baking, "
+            "instead of leaving it facing whichever way its own Gaussian "
+            "points. Raw splat orientations are noisy, and shading hundreds "
+            "of overlapping discs with noisy normals averages out to a flat "
+            "tint that barely reacts to lamps. Smoothing makes neighbours "
+            "share a facing so light can shade the form. Discs keep their "
+            "size, so the model looks the same unlit. This is usually the "
+            "difference between lighting working and not"))
+    def draw(self, context):
+        """Explicit layout so de-lighting reads as what it is: a sub-option of
+        scene lighting. Auto-generated dialogs would show it as a peer, which
+        invites people to move a slider that does nothing on an emission bake.
+        """
+        lay = self.layout
+        lay.use_property_split = True
+        lay.use_property_decorate = False
+        for name in ("cap", "min_opacity", "sh_mode", "use_texture",
+                     "soft", "boost"):
+            lay.prop(self, name)
+        lay.separator()
+        box = lay.box()
+        box.prop(self, "lit")
+        if not self.lit:
+            # The single most common confusion with this addon: bake with the
+            # default, then wonder why lamps do nothing. Say so plainly, at
+            # the moment the choice is made, rather than leaving it to the
+            # tooltip.
+            warn = box.column(align=True)
+            warn.label(text="Self-lit bake: lamps will NOT affect it.",
+                       icon='ERROR')
+            warn.label(text="Tick the box above to relight the model.")
+        sub = box.column()
+        sub.enabled = self.lit
+        sub.prop(self, "delight")
+        sub.prop(self, "emission_mix")
+        sub.prop(self, "align_discs")
+        sub.prop(self, "normal_mode")
+        sub.prop(self, "cast_shadows")
+        shad = sub.column(align=True)
+        shad.enabled = self.cast_shadows
+        shad.prop(self, "shadow_strength")
+        if self.lit and self.cast_shadows and self.shadow_strength > 0.5:
+            warn = sub.column(align=True)
+            warn.label(text="High Shadow Strength darkens the model:",
+                       icon='ERROR')
+            warn.label(text="each disc shadows the ones behind it.")
+        if self.lit:
+            from . import lighting
+            hint = lighting.scene_light_hint(context)
+            if hint:
+                box.label(text=hint, icon='INFO')
+            eng = lighting.engine_hint(context)
+            if eng:
+                box.label(text=eng, icon='ERROR')
+
     def invoke(self, context, event):
         # Baking is heavy: let the user set the cap/softness first instead of
         # firing with defaults. (Everything stays adjustable in the redo
@@ -1228,7 +1506,10 @@ class FGS_OT_bake(Operator):
         try:
             obj, n, mode, textured = _bake_cards(
                 r, context, self.cap, self.soft, self.boost, self.min_opacity,
-                self.sh_mode, cam_world, self.use_texture, self.lit)
+                self.sh_mode, cam_world, self.use_texture, self.lit,
+                self.delight, self.emission_mix, self.cast_shadows,
+                self.normal_mode, self.shadow_strength,
+                self.align_discs)
         except Exception as e:
             import traceback
             traceback.print_exc()          # full cause in the system console
@@ -1237,7 +1518,10 @@ class FGS_OT_bake(Operator):
         # Thousands of stacked transparent discs need deep transparency in
         # Cycles, or rays terminate early and leave dark blotches.
         cyc = getattr(context.scene, "cycles", None)
-        if cyc is not None and getattr(cyc, "transparent_max_bounces", 0) < 256:
+        engine_is_cycles = 'CYCLES' in str(
+            getattr(context.scene.render, "engine", "")).upper()
+        if (engine_is_cycles and cyc is not None
+                and getattr(cyc, "transparent_max_bounces", 0) < 256):
             try:
                 cyc.transparent_max_bounces = 256
             except Exception:
@@ -2090,6 +2374,7 @@ classes = (FGS_OT_load, FGS_OT_clear, FGS_OT_reset_transform, FGS_OT_remove_acti
            FGS_OT_duplicate, FGS_OT_copy, FGS_OT_paste, FGS_OT_best_quality,
            FGS_OT_apply_display_to_all, FGS_OT_walk, FGS_OT_reload_lod,
            FGS_OT_snapshot, FGS_OT_bake, FGS_OT_bake_surface,
+           FGS_OT_light_setup,
            FGS_OT_selftest, FGS_OT_test_splat,
            FGS_OT_click_select, FGS_OT_dolly_cursor,
            FGS_OT_frame, FGS_OT_pick_orbit, FGS_OT_select_splat,

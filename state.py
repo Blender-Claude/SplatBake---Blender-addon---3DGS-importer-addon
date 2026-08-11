@@ -8,7 +8,7 @@ global splat-delete history.
 
 import bpy
 
-VERSION = "1.11.1"
+VERSION = "1.16.1"
 
 RENDERERS = []          # active SplatRenderer instances
 ACTIVE = None           # the renderer last clicked / loaded
@@ -626,11 +626,17 @@ def restore_all():
 @bpy.app.handlers.persistent
 def _watch_box(scene, depsgraph):
     """When a box is deleted in the outliner/viewport, remove its model."""
-    if not RENDERERS:
+    if not RENDERERS and not TRASH:
         return
+    # Handles that CAME BACK are dealt with first - an undone deletion, or a
+    # Shift+D copy that needs a renderer. Only then is the survivor list built.
+    # Building it first was a real bug: the list was a snapshot taken before
+    # the new models were added, so assigning it back over RENDERERS threw
+    # them straight away again, and a duplicated model never appeared.
+    recovered = recover_orphans()
+    recovered = adopt_new_handles() or recovered
     survivors = [r for r in RENDERERS
                  if bpy.data.objects.get(r.box_name) is not None]
-    recovered = recover_orphans()
     if len(survivors) != len(RENDERERS):
         global ACTIVE
         for r in RENDERERS:
@@ -646,6 +652,66 @@ def _watch_box(scene, depsgraph):
         redraw_all()
     elif recovered:
         redraw_all()
+
+
+def adopt_new_handles():
+    """Give a renderer to any handle Empty that has a recipe but no splats.
+
+    This is what makes Blender's own Shift+D work. Duplicating the handle
+    copies the object and its custom properties, but the splats live in Python
+    state that Blender knows nothing about - so the copy would appear as an
+    empty box. Here the new handle is matched to a loaded model by its recipe,
+    and given an INSTANCE of it: same GPU buffers, its own transform and its
+    own alive mask.
+
+    Only handles whose source is already in the scene are adopted. Anything
+    else is left to the reload path, which reads it from disk.
+    """
+    try:
+        from . import persist
+        from .renderer import SplatRenderer
+    except Exception:
+        return False
+    live = {r.box_name for r in RENDERERS}
+    parked = {n for n, _ in TRASH}
+    donors = {}
+    for r in RENDERERS:
+        box = bpy.data.objects.get(r.box_name)
+        if box is None or persist.KEY not in box:
+            continue
+        try:
+            donors.setdefault(str(dict(box[persist.KEY]).get("file", "")), r)
+        except Exception:
+            pass
+    if not donors:
+        return False
+    made = []
+    for obj in bpy.data.objects:
+        if obj.type != 'EMPTY' or obj.name in live or obj.name in parked:
+            continue
+        if persist.KEY not in obj:
+            continue
+        try:
+            rec = dict(obj[persist.KEY])
+        except Exception:
+            continue
+        src = donors.get(str(rec.get("file", "")))
+        if src is None:
+            continue
+        try:
+            r = SplatRenderer(src.source, obj.name, src.rest_inv.copy(),
+                              share_from=src)
+            r.alive = src.alive.copy()
+        except Exception as e:
+            print("[SplatBake] could not instance duplicated handle:", e)
+            continue
+        RENDERERS.append(r)
+        made.append(obj.name)
+    if made:
+        add_handle()
+        print(f"[SplatBake] duplicated {len(made)} model(s) as instances "
+              f"(sharing GPU data)")
+    return bool(made)
 
 
 def _trash(r):

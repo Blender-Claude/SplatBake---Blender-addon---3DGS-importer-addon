@@ -1,10 +1,6 @@
 """SplatBake - import a Gaussian splat, bake it to real geometry, render it.
 
-Casu fictus, claudo favente
-    * Mars, Mattityahu, Yohanan and Claude
-
-Copyright (C) 2026 Blender-Claude and MMJ
-Home:    https://github.com/Blender-Claude
+Copyright (C) 2026 MMJ
 License: GPL-3.0-or-later (see LICENSE)
 
 This program is free software: you can redistribute it and/or modify it under

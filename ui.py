@@ -196,10 +196,12 @@ class FGS_PT_main(Panel):
                       icon="OUTLINER_OB_POINTCLOUD")
         bcol.operator("fgs.bake_surface", text="Bake Solid Surface (F12)",
                       icon="MESH_ICOSPHERE")
+        bcol.operator("fgs.light_setup", text="Set Up Lighting Test",
+                      icon="LIGHT_SUN")
         hint2 = rbox.column(align=True)
         hint2.scale_y = 0.75
-        hint2.label(text="Real meshes: render in Cycles / EEVEE")
         hint2.label(text="Bake dialog: tick 'React to Scene Lights'")
+        hint2.label(text="Lit bakes: use EEVEE, not Cycles")
 
 
 

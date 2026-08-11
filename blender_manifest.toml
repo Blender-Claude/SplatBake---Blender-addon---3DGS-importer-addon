@@ -1,17 +1,11 @@
 schema_version = "1.0.0"
 
 id = "splatbake"
-version = "1.11.1"
+version = "1.16.1"
 name = "Splatbake (WIP)"
 tagline = "Import a Gaussian splat, bake it to real geometry, render it"
-maintainer = "Blender-Claude and MMJ"
+maintainer = "MMJ"
 type = "add-on"
-
-# Casu fictus, claudo favente
-#   * Mars, Mattityahu, Yohanan and Claude
-
-# Link shown as the "Website" button in Blender's preferences.
-website = "https://github.com/Blender-Claude"
 
 tags = ["3D View", "Import-Export", "Render"]
 
@@ -22,7 +16,6 @@ license = [
 ]
 
 copyright = [
-  "2026 Blender-Claude",
   "2026 MMJ",
 ]
 

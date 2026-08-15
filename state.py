@@ -12,7 +12,7 @@ global splat-delete history.
 
 import bpy
 
-VERSION = "1.20.15"
+VERSION = "1.20.16"
 
 RENDERERS = []          # active SplatRenderer instances
 ACTIVE = None           # the renderer last clicked / loaded

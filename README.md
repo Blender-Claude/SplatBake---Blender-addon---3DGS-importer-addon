@@ -2,7 +2,7 @@
 
 **Import a Gaussian splat. Bake it. Render it.**
 
-*A Blender add-on by MMJ — free software under GPL-3.0-or-later.*
+*A Blender add-on by [Blender-Claude](https://github.com/Blender-Claude) — free software under GPL-3.0-or-later.*
 
 > Not affiliated with, sponsored by, or endorsed by the Blender Foundation.
 > Blender is a trademark of the Blender Foundation.
@@ -56,8 +56,9 @@ The panel appears in the 3D viewport sidebar (press **N**) under the
    - **Bake Discs** — one soft gaussian disc per splat. Closest to the
      captured look. Renders in Cycles and EEVEE with reflections, depth of
      field and motion blur.
-   - **Bake Solid Surface** — one watertight mesh, UV-unwrapped and textured.
-     Lit by your scene, sculptable, retopologisable, and exportable.
+   - **Bake Solid Surface** — *parked as experimental in 1.20.4; button
+     hidden.* One watertight mesh, UV-unwrapped and textured — returns once
+     the reconstruction earns its keep.
 5. **F12.**
 
 If you only want an image and not geometry, **Snapshot Still** captures the
@@ -66,7 +67,9 @@ picture that matches the viewport exactly.
 
 ## Exporting to OBJ, STL, glTF, FBX
 
-Bake **Solid Surface** first — that produces an ordinary Blender mesh, so every
+This section describes **Bake Solid Surface**, which is parked as experimental
+in 1.20.4 (button hidden while the disc bake is the supported path). When it
+returns: bake it first — that produces an ordinary Blender mesh, so every
 exporter works on it. Then **File → Export**.
 
 One thing worth knowing before you pick a format:
@@ -170,25 +173,39 @@ in true F12.
 
 ### Bake Solid Surface — a normal mesh
 
+> **Parked as experimental in 1.20.4.** The button is hidden and the code
+> is commented out in `operators.py` until the reconstruction meets the
+> bar; the disc bake is the supported path. The notes below document the
+> parked design.
+
 Each splat contributes a blob **sized by its own gaussian**, the density is
 sampled on a voxel grid, and the isosurface is extracted — giving one solid
 mesh that is lit by your scene and casts shadows.
 
-Three controls decide how closely it follows the splat contour:
+Four controls decide how closely it follows the splat contour:
 
 - **Match Splat Size (auto detail)** — on by default. Grid resolution depends
   entirely on how big the splats are relative to the scene, so a fixed number
   rarely fits. On one real 1.9M-splat scan the scene spans 363 units while a
   typical splat radius is 0.044: even at detail 400 the voxel is 21× larger
   than a splat, every blob collapses to a single voxel, and the surface simply
-  cannot follow the contour. Auto targets about two voxels per splat and picks
-  ~4000 for that scan. The status bar reports the voxel size against the splat
-  size after every bake.
+  cannot follow the contour. Auto targets about two voxels per splat radius,
+  capped at detail 8000 (that scan hits the cap, landing at ~1 voxel per
+  radius). The status bar reports the voxel size against the splat size after
+  every bake.
 - **Surface Tightness** — the isosurface level. Low sits far out in each
   splat's falloff (puffier, closes gaps); high hugs the dense core (tighter to
   the real contour, but can open holes in thin areas).
 - **Blob Size** — multiplies each splat's own radius. Raise it to close holes
   in a sparse scan, lower it for a leaner surface that follows fine detail.
+- **Snap to Splats** — on by default. A density isosurface can only sit
+  somewhere out in the summed falloff, inflated by an amount that varies with
+  splat overlap — no Tightness value is right everywhere. This pass pulls
+  every extracted vertex onto the opacity-weighted plane of its nearest
+  splats (a moving-least-squares projection using the same smoothed normals
+  as the lit bake), so the shell sits *on* the splats instead of hovering
+  over them. Vertices where the volume bridged a real gap are left where
+  they are, and the status bar reports how many vertices moved and how far.
 
 Splats over the point cap are now kept by opacity importance, so solid
 structure survives and haze goes first.
@@ -205,11 +222,33 @@ gutter and draw dark seams along island edges.
 
 ## Scene-lit baking (experimental)
 
-By default a baked model is **emission**: it carries the captured lighting and
-looks the same whether the scene has lamps or not. Tick **React to Scene Lights
-(Experimental)** in the disc-bake dialog and the colour becomes *albedo* on a
-diffuse surface instead, so Blender has to light it — black with no lamps and a
-black world, lit when a lamp shines on it, casting and receiving shadows.
+With **React to Scene Lights (Experimental)** off, a baked model is
+**emission**: it carries the captured lighting and looks the same whether the
+scene has lamps or not. With it on (the default since 1.20.7), the bake uses
+the **same lighting model as the viewport preview**: the captured colour is
+*multiplied* by `ambient + incoming light`, where the incoming light is read
+back from the renderer through a Shader-to-RGB pass — so the model keeps its
+palette, brightens where lamps reach it, and darkens where they don't, exactly
+like the preview's scene lighting. (Earlier builds re-lit a de-lit albedo with
+physically-correct wattage instead; that was correct and looked nothing like
+the preview, which normalises energies and "shows where light lands, not
+photometric values". Preview and bake now agree by construction.) This shading
+relies on Shader to RGB, an EEVEE node — in Cycles it degrades to a dim
+ambient look, and EEVEE was already the recommended engine for lit bakes.
+
+**Light Gain** (default 3) sets how strongly incoming light registers. The
+panel's preview lighting has the same slider, and since 1.20.12 both convert
+lamp watts the same physical way (a sun's strength is irradiance; a point
+lamp's watts become intensity over 4·pi, then a diffuse response over pi), so
+moving it moves preview and bake together instead of tuning two unrelated
+looks. Earlier builds scaled preview energies by arbitrary constants chosen
+to look sane, which is why a lamp could read completely differently in the
+two. The
+model shows its captured palette even unlit, so at gain 1 — physically matched
+to a plain cube — a lamp must outshine that baseline before the eye sees any
+change, which reads as "I have to hold the lamp right next to it". Gain 3
+makes the model respond at roughly the distances a normal object does; it is
+a taste dial, not a physics one.
 
 Each disc spans its splat's two largest covariance axes, so its face normal is
 the smallest axis: the standard surface-normal estimate, which is what makes the
@@ -230,22 +269,101 @@ that goes wrong.
 hundreds of thousands of overlapping discs. If every disc casts a shadow, each
 one lands in the shadow of the dozens stacked in front of it — light reaches
 the outer shell and nothing else, and the model renders as a black blob with a
-faintly lit rim. **Cast Shadows is therefore off by default**, and when you do turn it on,
-**Shadow Strength** (default 0.15) controls how solid the model looks to shadow
-rays only. Low values let light through the cloud so the model still lights up
-while still dropping a shadow onto the floor. Camera rays are untouched, so it
-never changes how the model itself looks. At 1.0 you get the full blackout. Self-shadowing
-is also double-counting: the shoot's own occlusion is already baked into the
-colours. Turn it on only when the model must drop a shadow onto other
-geometry, and expect it to darken.
+faintly lit rim. Since 1.20.5 that failure is structurally impossible: the
+visible model **never** enters a shadow map. With **Cast Shadows** on (the
+default since 1.20.9), the
+shadow is carried by a camera-invisible twin object (`<name>_shadow`, shown as
+bounds in the viewport, shrunk 4% so the model's lit shell sits outside its
+own caster), and **Shadow Strength** (default 1.0, per disc — a dense, honest
+shadow; lower it to let light bleed through the cloud) sets how dense that
+dropped shadow is — the model's own appearance never changes, in EEVEE or Cycles.
+Deleting a bake does not delete its twin (Blender never deletes children with
+parents), so every lit bake first purges twins whose model is gone and says so
+in the console; the twin is selectable, so box-selecting model + twin deletes
+both. (Earlier builds thinned shadows per-ray with the Light Path node,
+which EEVEE only partially supports: in the engine this add-on recommends the
+trick never ran, and a lit bake with shadows on went black. Found on a real
+scene, fixed by moving the mechanism to the object level where both engines
+agree.) Self-shadowing inside a capture would be double-counting anyway: the
+shoot's own occlusion is already baked into the colours.
 
 **Nothing to catch.** No lamps and a black world means no light, and the bake
 dialog warns about this before you run it.
 
-**Keep Captured Colour** blends some of the original colour back in as
-emission, so the model stays readable even where no lamp reaches it. It turns
-the feature into a dial from captured look to fully relit, rather than a
-switch between two extremes. Default 0.25.
+**Match Preview Settings** (on by default, at the top of the disc-bake
+dialog) makes the bake reproduce what the viewport is showing rather than
+carrying its own separate settings. It takes **View Colour Quality** (off /
+low / medium / full SH — the bake evaluates the same number of coefficients),
+**Gaussian Mode** (the soft classic kernel versus the normalised web-exact
+one), and **AA Compensation** (the reference viewer's opacity compensation,
+computed per splat for the bake camera). When the bake is lit it also takes
+**Preview Lighting**, **Light Gain** and **Preview Ambient**. Two things
+cannot follow, because they are screen-space decisions with no meaning on a
+static mesh: the 2 px minimum-size discard and the 1/255 alpha clip. The
+overridden rows stay visible but greyed out, with a line naming what was
+taken, so a driven setting never looks like an ignored one.
+
+**Keep Captured Colour** blends some of the original colour back in, so the
+model stays readable even where no lamp reaches it. It turns the feature into
+a dial from captured look to fully relit, rather than a switch between two
+extremes. Default 0 — fully relit; the ambient floor still keeps unlit
+regions faintly visible, and raising the dial brings back the captured look.
+
+### Live lighting preview (no bake)
+
+**Preview Scene Lighting** in the panel shades the live splats with the
+scene's lamps, in the viewport, before any bake. Place a lamp, drag it, and
+watch which parts of the capture catch it. Two sliders: **Preview Lighting**
+blends between the captured look and the lit result, and **Preview Ambient**
+adds flat light so unlit sides stay readable.
+
+It runs in the vertex shader, per splat, using each splat's shortest
+covariance axis as its normal — the same estimate the bake uses. Up to four
+lamps (sun, point and spot), transformed into model space on the CPU so no
+extra matrix work happens per splat. It costs nothing when off.
+
+**Large scenes.** Distance LOD normally swaps far models to the point shader,
+which has no normals and so no lighting — and on a big capture the model centre
+is almost always past that threshold, which made whole scenes silently unlit
+while small objects worked. With the preview on, lighting now wins over that
+swap. Note this costs the LOD speedup, so a very large scene will navigate more
+slowly with the preview on than with it off.
+
+**Up to 16 lights at once**, which covers an interior capture with a full set
+of practicals. Light data is packed into a small texture rather than shader
+uniforms — three vec4s per light would need 48 uniforms at this count, and
+push-constant space is tight on low-end GPUs. The shader loop stops at the
+number of lights actually present, so a scene with two lamps pays for two.
+Beyond 16, the strongest contributors are used.
+
+**Lamp types.** Sun uses its direction and is distance-independent. Point and
+area fall off with inverse square; an area lamp is really an emitting surface,
+so treating it as a point makes it harsher than it should be — raise Preview
+Softness to compensate, and trust the bake for real falloff. Spot honours its
+cone and blend. Above four lamps the strongest contributors are chosen rather
+than whichever come first in the scene. Lamp nodes and custom falloff curves
+are not read.
+
+**Preview Softness** controls the light terminator. Splat normals are noisy —
+many gaussians are near-isotropic blobs whose shortest axis is arbitrary — so
+hard lighting flips neighbouring splats between lit and black and the capture
+looks speckled. Wrapping the diffuse term pushes the terminator out so a normal
+that is wrong by a few degrees shifts the shading slightly instead of switching
+it off. The same trick is standard for foliage and skin, for the same reason.
+Raise it if the preview is grainy, lower it for crisper lighting.
+
+**It only works in Splats display mode.** Point Cloud draws through a separate,
+unlit shader, and it is the default — so the first thing to check if the
+preview appears to do nothing is the Splats / Point Cloud toggle. The panel
+warns about this and shows a live status line (how many lamps it found, or why
+it is off).
+
+**Treat it as a guide, not a proof.** Both the preview and the lit bake now
+shade the raw per-splat orientations (smoothed re-seating was removed in
+1.20.10 — see below), so the two read very similarly. Lamp energies are also scaled to look
+sane rather than to be photometric — Blender's wattages are tuned for a path
+tracer and blow the preview to white if used raw. Use it to decide *where*
+lights go; use the bake for how it will actually look.
 
 ### Why per-disc relighting is hard (and what actually works)
 
@@ -274,12 +392,17 @@ lamp moves to the opposite side:
 | realistic | 0.13 | 0.46 |
 | very blobby | 0.10 | 0.46 |
 
-**Align Discs to Surface** (on by default) fixes this. It orients normals
-consistently, averages each with its spatial neighbours — noise is
-uncorrelated between neighbours and cancels, real surface orientation is
-shared and survives — then re-seats each disc into that smoothed plane. Discs
-keep their extents, so the model looks the same unlit; only the facing
-changes, and flat shading reads the coherent normal straight off the geometry.
+**Align Discs to Surface was removed in 1.20.10.** It re-seated each disc
+into a smoothed surface plane, and under the old physical lighting model that
+was the difference between lighting working and not: noisy normals averaged
+out to a flat tint. Under the preview-matched shading (1.20.7) it flipped
+into a defect — coherently oriented, elongated discs each carrying one
+uniform tint read as literal brushstrokes painted on the model — while the
+raw orientations produce fine-grained variance that blends like the capture's
+own fuzz and matches the preview. Consistent outward winding (which **True
+Orientation** relies on) is kept; only the re-seating is gone. The table
+above documents why alignment existed; it stays as the record of the old
+model's failure mode.
 
 **For real shadows and reflections, use Bake Solid Surface instead.** A cloud
 of transparent billboards has no coherent surface to reflect anything. The
@@ -288,10 +411,14 @@ proxy-geometry approach production tools use.
 
 ### If lamps do nothing at all, check this first
 
-**React to Scene Lights is OFF by default.** With it off the bake is emission —
-self-lit, identical regardless of lighting, exactly as if no lamp existed. This
-is the most common confusion with the addon, so the bake dialog now warns about
-it in place rather than leaving it to the tooltip.
+**React to Scene Lights is ON by default since 1.20.7.** With it off the bake
+is emission — self-lit, identical regardless of lighting, exactly as if no lamp
+existed. That was the most common confusion with the addon; the dialog still
+warns in place whenever the box is unticked. With it on, remember the lamps
+only *show* in a viewport set to **Rendered** shading — Solid and Material
+Preview ignore scene lights, and since 1.20.7 the bake prints the full lighting
+environment (engine, viewport modes, lamps, parameters) to the console so a
+dark result explains itself.
 
 ### Normals
 
@@ -460,8 +587,8 @@ directional shading for a fifth of the data.
 
 ## Point Cloud While Moving
 
-The most direct way to keep navigation fluid: tick **Point Cloud While
-Moving** and the viewport drops to points the instant the view starts
+The most direct way to keep navigation fluid: **Point Cloud While
+Moving** (on by default) drops the viewport to points the instant the view starts
 changing, returning to splats about a second after it stops. Points skip the
 gaussian shading entirely, so the cost is a fraction of a splat draw.
 
@@ -480,7 +607,7 @@ Splats must be drawn back-to-front to blend correctly, and reordering millions
 of them is the dominant cost of moving the camera — measured at **1.6 seconds**
 for 9.35M splats, against under 0.3 for everything else combined.
 
-**Adaptive Depth Sort** (on by default) sorts into 256 depth buckets while the
+**Adaptive Depth Sort** (off by default; tick it for large scenes) sorts into 256 depth buckets while the
 view is moving — about **14× faster** — and runs the exact sort the moment the
 camera stops. So an approximate blend order only ever exists while you are
 actively moving, and whatever you settle on looking at is always correctly
@@ -600,9 +727,28 @@ OBJ or glTF if the texture needs to travel.
 harmonics is well over a gigabyte before Blender's own overhead. Use the
 Max Splats budget and the Streamed SOG Detail options.
 
-**Ctrl+C on a mixed selection** copies the splat models and leaves ordinary
-Blender objects to Blender's own clipboard; the two do not merge into one
-paste. Copy them in separate passes.
+**True Scale (1:1 handle)** in the import options gives the model's handle an
+identity transform — Scale (1,1,1) at the model centre — so the file's units
+pass through untouched and the sidebar reads true. Unticked (the default), the
+handle is scaled to frame the cloud: convenient to grab, but its Scale shows
+the model's half-extents, and clearing that scale squashes the model. The
+splats render at the same size either way; the tickbox changes what the
+handle's numbers mean. The add-on itself never rescales the data — every
+format draws at the file's own coordinates.
+
+**Clicking selects whatever is actually in front** (since 1.20.12). The
+add-on binds plain left-click so splats can be picked like any other object,
+and it used to claim every click that landed on a capture — so an ordinary
+Blender object standing in front of the splats could not be selected at all.
+The click now runs Blender's own ray_cast first and steps aside whenever real
+geometry is nearer, which also covers baked meshes and their shadow twins.
+
+**Ctrl+C follows the active object** (since 1.20.11). If the active object is
+an ordinary Blender object, the copy is Blender's own — the splat clipboard is
+dropped so the next Ctrl+V pastes your object, not a stale splat. If the
+active object is a splat handle, the selected splat models are copied as
+before. On a mixed selection the active object decides which world you are
+copying in; copy in separate passes if you want both.
 
 ## Reporting a bug
 
@@ -622,7 +768,37 @@ For import problems, it also helps a lot to say which tool exported the file.
 
 ## License
 
-Copyright (C) 2026 MMJ. Released under GPL-3.0-or-later — see `LICENSE.md`.
+Copyright (c) 2026 [Blender-Claude](https://github.com/Blender-Claude). The project is split
+in two, along a real line in the code:
+
+| | License | What it is |
+|---|---|---|
+| everything outside `splatcore/` | **GPL-3.0-or-later** | the Blender add-on — calls `bpy`, `gpu`, `mathutils` |
+| `splatcore/` | **Apache-2.0** | Blender-free data core — `.ply` / `.splat` / SOG parsing, spherical harmonics, the BucketGrid |
+
+The add-on half is GPL because Blender's Python API is an integral part of
+Blender, so the Foundation's position is that published add-ons using it must
+be shared under a GPL-compliant license — and the Extensions platform requires
+`SPDX:GPL-3.0-or-later` specifically. The core half imports nothing from
+Blender and is not derived from it, so it carries no such obligation and is
+offered under Apache-2.0, patent grant included:
+
+```python
+from splatcore import loaders
+data = loaders.load_any("capture.ply", want_sh=True)
+```
+
+SOG decoding, the one place Blender used to leak into the core, is now a hook
+(`splatcore.sog.IMAGE_READER`) — the add-on installs Blender's decoder, a
+standalone user gets Pillow. Shipping the two together is legitimate because
+Apache-2.0 code may be incorporated into a GPLv3 work; the reverse does not
+hold, so nothing GPL may be added to `splatcore/`. Full texts:
+`LICENSE-GPL-3.0.txt` and `splatcore/LICENSE`.
+
+Parts of this project were written with the assistance of Claude (Anthropic),
+credited as a development tool rather than a rights holder — copyright
+requires human authorship, so it rests with the human author behind the
+maintainer account.
 
 Splat scenes you import carry their own licenses. Many public captures are
 CC-BY and require crediting the original author in anything you publish.

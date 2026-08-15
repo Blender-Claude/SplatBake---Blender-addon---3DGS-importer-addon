@@ -12,6 +12,10 @@ is verified separately (the loader forces 'Standard', for which the linearise
 round-trip is mathematically exact).
 """
 
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 Blender-Claude
+
+
 import numpy as np
 import gpu
 from gpu_extras.batch import batch_for_shader

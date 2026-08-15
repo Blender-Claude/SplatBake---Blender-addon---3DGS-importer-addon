@@ -1,22 +1,30 @@
 schema_version = "1.0.0"
 
 id = "splatbake"
-version = "1.16.1"
+version = "1.20.15"
 name = "Splatbake (WIP)"
 tagline = "Import a Gaussian splat, bake it to real geometry, render it"
-maintainer = "MMJ"
+maintainer = "Blender-Claude (github.com/Blender-Claude)"
 type = "add-on"
 
 tags = ["3D View", "Import-Export", "Render"]
 
 blender_version_min = "4.2.0"
 
+# Two licenses, two halves - NOT a dual grant on the same code:
+#   * the add-on itself (everything outside splatcore/) is GPL-3.0-or-later,
+#     which is what the Extensions platform requires of anything calling the
+#     bpy API, and what the combined distribution as a whole is governed by;
+#   * splatcore/ is Apache-2.0 and Blender-free, so it can be lifted out and
+#     used on its own. Apache-2.0 code may be combined into a GPLv3 work,
+#     which is what makes shipping them together legitimate.
 license = [
   "SPDX:GPL-3.0-or-later",
+  "SPDX:Apache-2.0",
 ]
 
 copyright = [
-  "2026 MMJ",
+  "2026 Blender-Claude",
 ]
 
 # Only the permissions actually used are declared. Note that Ctrl+C / Ctrl+V

@@ -21,6 +21,10 @@ first, so nothing jumps the moment you enable it: you start from exactly what
 you were already looking at and diverge from there.
 """
 
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 Blender-Claude
+
+
 import bpy
 from bpy.props import (BoolProperty, EnumProperty, FloatProperty,
                        PointerProperty)

@@ -1,6 +1,6 @@
 """SplatBake - import a Gaussian splat, bake it to real geometry, render it.
 
-Copyright (C) 2026 MMJ
+Copyright (C) 2026 Blender-Claude
 License: GPL-3.0-or-later (see LICENSE)
 
 This program is free software: you can redistribute it and/or modify it under
@@ -31,12 +31,20 @@ Modules:
     ui         - the N-panel and the scene properties
 """
 
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 Blender-Claude
+
+
 from . import state, operators, ui, persist, permodel
+from . import blender_image
 
 
 def register():
     # First: the per-model PropertyGroup must exist before the panel or the
     # draw callback can reference Object.splatbake_display.
+    # Hand Blender's image decoder to the Apache-licensed core, which is
+    # deliberately Blender-free and would otherwise fall back to Pillow.
+    blender_image.install()
     permodel.register()
     operators.register()
     ui.register()

@@ -7,6 +7,10 @@ locks everything to source-viewer parity. All other engine props stay registered
 at spec defaults so the shared renderer keeps working.
 """
 
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 Blender-Claude
+
+
 import bpy
 from bpy.props import FloatProperty, BoolProperty, EnumProperty, FloatVectorProperty
 from bpy.types import Panel, AddonPreferences
@@ -20,7 +24,7 @@ class FGS_Prefs(AddonPreferences):
 
     wave_default: bpy.props.BoolProperty(
         name="Reveal Animation by Default",
-        default=True,
+        default=False,
         description="Default for the point-cloud -> gaussian reveal in every "
                     ".blend file. Each scene's own tickbox (N-panel) can "
                     "still override it per file")
@@ -194,10 +198,34 @@ class FGS_PT_main(Panel):
         bcol = rbox.column(align=True)
         bcol.operator("fgs.bake_mesh", text="Bake Discs (for F12)",
                       icon="OUTLINER_OB_POINTCLOUD")
-        bcol.operator("fgs.bake_surface", text="Bake Solid Surface (F12)",
-                      icon="MESH_ICOSPHERE")
-        bcol.operator("fgs.light_setup", text="Set Up Lighting Test",
-                      icon="LIGHT_SUN")
+        # EXPERIMENTAL, parked in 1.20.4: the solid-surface bake and its
+        # lighting test are hidden while the disc bake is the supported
+        # path. Their operators are commented out in operators.py too.
+        # bcol.operator("fgs.bake_surface", text="Bake Solid Surface (F12)",
+        #               icon="MESH_ICOSPHERE")
+        # bcol.operator("fgs.light_setup", text="Set Up Lighting Test",
+        #               icon="LIGHT_SUN")
+        lp = rbox.box()
+        lp.prop(context.scene, "fgs_lit_preview")
+        lsub = lp.column(align=True)
+        lsub.enabled = context.scene.fgs_lit_preview
+        lsub.prop(context.scene, "fgs_lit_preview_mix")
+        lsub.prop(context.scene, "fgs_lit_preview_wrap")
+        lsub.prop(context.scene, "fgs_lit_preview_gain")
+        lsub.prop(context.scene, "fgs_lit_preview_ambient")
+        if context.scene.fgs_lit_preview:
+            # Point Cloud mode draws through a different, unlit shader, so the
+            # preview silently does nothing there. That is the single most
+            # confusing way for this to "not work", so say it outright.
+            if context.scene.fgs_display_mode == 'POINTS':
+                w = lsub.column(align=True)
+                w.label(text="Point Cloud mode is unlit.", icon='ERROR')
+                w.label(text="Switch to Splats to see lighting.")
+            try:
+                from . import renderer as _r
+                lsub.label(text="Status: " + str(_r.PREVIEW_STATUS))
+            except Exception:
+                pass
         hint2 = rbox.column(align=True)
         hint2.scale_y = 0.75
         hint2.label(text="Bake dialog: tick 'React to Scene Lights'")
@@ -353,6 +381,39 @@ def register():
                     "edges, wires, hair - keep their full sharpness). Raise "
                     "(~6-10) only if a scene shows needle spike artifacts; "
                     "clamping needles also rounds off fine linear detail")
+    # -- live lighting preview ------------------------------------------
+    S.fgs_lit_preview = BoolProperty(
+        name="Preview Scene Lighting", default=False, update=_redraw,
+        description=(
+            "Shade the live splats with the scene's lamps, in the viewport, "
+            "without baking. Shows where light lands so lamps can be placed "
+            "before committing to a bake. Uses each splat's own normal, so "
+            "it is a guide rather than an exact match for the baked result"))
+    S.fgs_lit_preview_mix = FloatProperty(
+        name="Preview Lighting", default=1.0, min=0.0, max=1.0,
+        subtype='FACTOR', update=_redraw,
+        description="Blend between the captured look and the lit preview")
+    S.fgs_lit_preview_wrap = FloatProperty(
+        name="Preview Softness", default=0.5, min=0.0, max=1.0,
+        subtype='FACTOR', update=_redraw,
+        description=(
+            "Softens the light terminator. Splat normals are noisy, so hard "
+            "lighting makes neighbouring splats flip between lit and black "
+            "and the capture looks speckled. Raise this if the preview is "
+            "grainy; lower it for crisper, more contrasty lighting"))
+    S.fgs_lit_preview_gain = FloatProperty(
+        name="Light Gain", default=3.0, min=0.1, max=10.0, update=_redraw,
+        description=(
+            "How strongly incoming light registers. Shared with the disc "
+            "bake's Light Gain, and both use the same physical conversion "
+            "from lamp watts, so this slider moves the preview and the bake "
+            "together. 1.0 is the physically matched value; 3 makes a "
+            "capture respond at the distances an ordinary object does"))
+    S.fgs_lit_preview_ambient = FloatProperty(
+        name="Preview Ambient", default=0.15, min=0.0, max=2.0,
+        subtype='FACTOR', update=_redraw,
+        description=("Flat light added everywhere, so unlit sides stay "
+                     "readable instead of going black"))
     S.fgs_exposure = FloatProperty(name="Exposure", default=1.0, min=0.1,
                                    max=4.0, update=_redraw)
     S.fgs_saturation = FloatProperty(name="Saturation", default=1.0, min=0.0,
@@ -370,13 +431,13 @@ def register():
     S.fgs_hq_sort = BoolProperty(name="Per-frame Sort", default=True,
                                  update=_redraw)
     S.fgs_points_moving = BoolProperty(
-        name="Point Cloud While Moving", default=False, update=_redraw,
+        name="Point Cloud While Moving", default=True, update=_redraw,
         description="Drop to a point cloud the instant the view starts "
                     "moving, and return to splats about a second after it "
                     "stops. Works for every kind of movement - orbit, pan, "
                     "walk, fly, or an animated camera")
     S.fgs_adaptive_sort = BoolProperty(
-        name="Adaptive Depth Sort", default=True, update=_redraw,
+        name="Adaptive Depth Sort", default=False, update=_redraw,
         description="While the view is moving, sort splats into 256 depth "
                     "buckets instead of ordering them exactly - measured "
                     "about 12x faster on a 9M-splat scene. The buckets are "
@@ -428,6 +489,8 @@ def unregister():
               "fgs_lod", "fgs_lod_points", "fgs_show_bbox",
               "fgs_per_model", "fgs_cull_frustum", "fgs_adaptive_sort",
               "fgs_points_moving",
-              "fgs_saturation", "fgs_gamma", "fgs_tint"):
+              "fgs_saturation", "fgs_gamma", "fgs_tint",
+              "fgs_lit_preview", "fgs_lit_preview_mix",
+              "fgs_lit_preview_ambient", "fgs_lit_preview_wrap"):
         if hasattr(S, p):
             delattr(S, p)

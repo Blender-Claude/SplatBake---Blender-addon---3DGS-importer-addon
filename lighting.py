@@ -92,6 +92,10 @@ baked specular highlights. Those stay. It is a real improvement, not a
 solution, so it is a 0-1 slider rather than a switch, defaulting to partial.
 """
 
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 Blender-Claude
+
+
 import numpy as np
 import bpy
 
@@ -121,10 +125,49 @@ NORMAL_CAMERA = 'CAMERA'
 NORMAL_TRUE = 'TRUE'
 
 
+def _soft_alpha(nt, kernel='NORM'):
+    """Kernel-matched soft alpha: the gaussian falloff over the disc UVs times
+    the per-splat "Opac" attribute. Shared by the lit material and the shadow
+    proxy, so a dropped shadow is shaped by exactly the discs the camera sees.
+    """
+    uv = nt.nodes.new('ShaderNodeUVMap')
+    uv.uv_map = "UVMap"                    # the kernel UVs, not the atlas
+    uv.location = (-900, -220)
+    dot = nt.nodes.new('ShaderNodeVectorMath')
+    dot.operation = 'DOT_PRODUCT'
+    dot.location = (-720, -220)
+    nt.links.new(uv.outputs["UV"], dot.inputs[0])
+    nt.links.new(uv.outputs["UV"], dot.inputs[1])
+    # 'NORM' : (exp(-A) - exp(-4)) / (1 - exp(-4)), clamped at 0 - the
+    #          viewport's normalised PC/V215 kernel, zero at the quad edge.
+    # 'PLAIN': exp(-A) - the viewport's SOFT (classic Blender) kernel.
+    a4 = _math(nt, 'MULTIPLY', dot.outputs["Value"], 4.0)
+    falloff = _math(nt, 'EXPONENT', _math(nt, 'MULTIPLY', a4, -1.0))
+    if kernel == 'PLAIN':
+        gauss = falloff
+    else:
+        gauss = _math(nt, 'MAXIMUM',
+                      _math(nt, 'DIVIDE',
+                            _math(nt, 'SUBTRACT', falloff, _EDGE),
+                            1.0 - _EDGE),
+                      0.0)
+    opac = nt.nodes.new('ShaderNodeAttribute')
+    opac.attribute_name = "Opac"
+    opac.location = (-720, -420)
+    return _math(nt, 'MULTIPLY', gauss, opac.outputs["Fac"])
+
+
 def build_lit_material(name, soft, color_img=None, roughness=1.0,
                        atlas_uv="SplatCol", emission_mix=0.0,
-                       normal_mode=NORMAL_CAMERA, shadow_strength=1.0):
-    """Diffuse material for baked splats, lit by the scene.
+                       normal_mode=NORMAL_CAMERA, ambient=0.15, gain=3.0,
+                       kernel='NORM'):
+    """Preview-matched relight material for baked splats.
+
+    Computes the same equation as the viewport preview's scene lighting -
+    captured colour times (ambient + incoming light) - via a white Diffuse
+    BSDF read back through Shader to RGB, so a bake finally responds to
+    lamps the way the preview taught the user to expect. EEVEE is the
+    target engine for this, as it always was for lit bakes.
 
     soft      : keep the radial gaussian alpha (times per-splat opacity), so
                 discs stay soft-edged instead of hard squares.
@@ -157,11 +200,31 @@ def build_lit_material(name, soft, color_img=None, roughness=1.0,
         attr.location = (-500, 120)
         base = attr.outputs["Color"]
 
-    # Diffuse, not Principled: millions of overlapping discs each adding a
-    # specular lobe reads as glitter, and costs more to render for no gain.
-    bsdf = nt.nodes.new('ShaderNodeBsdfDiffuse')
-    bsdf.location = (-120, 120)
-    nt.links.new(base, bsdf.inputs["Color"])
+    # -- the lighting model: the PREVIEW's, not a physical one (1.20.7) ----
+    #
+    # The physical version (de-lit albedo on a Diffuse BSDF) was correct and
+    # useless. The viewport preview relights by multiplying the CAPTURED
+    # colour with `ambient + lambert`, energies normalised - in its own
+    # words it "shows WHERE light lands, not photometric values"
+    # (renderer.gather_preview_lights). Users calibrate on that. Real
+    # wattage on a de-lit albedo can never look like it, so bakes read as
+    # "the light is not detected" no matter how correct they are.
+    # The bake now computes the preview's equation instead:
+    #
+    #     final = colour * mix(ambient + incoming_light, 1.0, keep)
+    #
+    # `incoming_light` is a white Diffuse BSDF captured by Shader to RGB -
+    # the one node that hands the renderer's own lighting (lamps, world,
+    # shadow maps) back as a colour to compose with. Shader to RGB is an
+    # EEVEE node by nature; engine_hint already steers lit bakes to EEVEE,
+    # and in Cycles this degrades to a dim ambient look instead of breaking.
+    white = nt.nodes.new('ShaderNodeBsdfDiffuse')
+    white.location = (-620, 320)
+    white.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+    try:
+        white.inputs["Roughness"].default_value = float(roughness)
+    except Exception:
+        pass
 
     # NORMAL_TRUE undoes the renderer's backface flip: N * (1 - 2 * Backfacing)
     # restores the orientation the bake chose. Left alone (NORMAL_CAMERA) the
@@ -174,89 +237,77 @@ def build_lit_material(name, soft, color_img=None, roughness=1.0,
                      _math(nt, 'MULTIPLY', geo.outputs["Backfacing"], 2.0))
         flipn = nt.nodes.new('ShaderNodeVectorMath')
         flipn.operation = 'SCALE'
-        flipn.location = (-330, 420)
+        flipn.location = (-780, 420)
         nt.links.new(geo.outputs["Normal"], flipn.inputs[0])
         nt.links.new(sign, flipn.inputs["Scale"])
-        nt.links.new(flipn.outputs["Vector"], bsdf.inputs["Normal"])
-    try:
-        bsdf.inputs["Roughness"].default_value = float(roughness)
-    except Exception:
-        pass
+        nt.links.new(flipn.outputs["Vector"], white.inputs["Normal"])
 
-    # A pure diffuse albedo shows NOTHING until a lamp reaches it, and inside a
-    # dense splat cloud most splats are buried behind hundreds of others. That
-    # is a cliff: the user ticks the box and the model goes black, with no way
-    # to tell a lighting problem from a bake problem. Blending a little of the
-    # captured colour back in as emission keeps the model readable and gives a
-    # continuous dial from "captured look" to "fully relit" instead of a
-    # switch between two extremes.
-    shaded = bsdf.outputs["BSDF"]
-    if float(emission_mix) > 0.0:
-        emis = nt.nodes.new('ShaderNodeEmission')
-        emis.location = (-120, 300)
-        nt.links.new(base, emis.inputs["Color"])
-        mixe = nt.nodes.new('ShaderNodeMixShader')
-        mixe.location = (120, 200)
-        mixe.inputs[0].default_value = float(min(emission_mix, 1.0))
-        nt.links.new(bsdf.outputs["BSDF"], mixe.inputs[1])
-        nt.links.new(emis.outputs["Emission"], mixe.inputs[2])
-        shaded = mixe.outputs["Shader"]
+    s2rgb = nt.nodes.new('ShaderNodeShaderToRGB')
+    s2rgb.location = (-440, 320)
+    nt.links.new(white.outputs["BSDF"], s2rgb.inputs["Shader"])
+
+    amb = float(max(ambient, 0.0))
+    keep = float(np.clip(emission_mix, 0.0, 1.0))
+    # Light Gain: the model shows its captured palette even unlit (ambient +
+    # Keep Captured Colour form a constant floor of roughly a quarter of the
+    # palette), so a lamp must OUTSHINE that floor before the eye sees any
+    # change - while a plain cube starts from black and registers the
+    # faintest light. Same physics, different baseline. Boosting the
+    # incoming light before it is composed makes the model respond at
+    # cube-like distances; 1.0 is the physically-matched setting.
+    boost = nt.nodes.new('ShaderNodeVectorMath')
+    boost.operation = 'SCALE'
+    boost.location = (-350, 320)
+    nt.links.new(s2rgb.outputs["Color"], boost.inputs[0])
+    boost.inputs["Scale"].default_value = float(max(gain, 0.0))
+    term = nt.nodes.new('ShaderNodeVectorMath')   # ambient + gain * light
+    term.operation = 'ADD'
+    term.location = (-260, 320)
+    nt.links.new(boost.outputs["Vector"], term.inputs[0])
+    term.inputs[1].default_value = (amb, amb, amb)
+    # keep-dial: lerp the light term toward 1.0 so "Keep Captured Colour"
+    # still runs from fully relit (0) to the untouched capture (1).
+    scaled = nt.nodes.new('ShaderNodeVectorMath')
+    scaled.operation = 'SCALE'
+    scaled.location = (-100, 320)
+    nt.links.new(term.outputs["Vector"], scaled.inputs[0])
+    scaled.inputs["Scale"].default_value = 1.0 - keep
+    lerped = nt.nodes.new('ShaderNodeVectorMath')
+    lerped.operation = 'ADD'
+    lerped.location = (60, 320)
+    nt.links.new(scaled.outputs["Vector"], lerped.inputs[0])
+    lerped.inputs[1].default_value = (keep, keep, keep)
+    final_col = nt.nodes.new('ShaderNodeVectorMath')
+    final_col.operation = 'MULTIPLY'
+    final_col.location = (220, 220)
+    nt.links.new(base, final_col.inputs[0])
+    nt.links.new(lerped.outputs["Vector"], final_col.inputs[1])
+
+    emis = nt.nodes.new('ShaderNodeEmission')
+    emis.location = (380, 160)
+    nt.links.new(final_col.outputs["Vector"], emis.inputs["Color"])
+    shaded = emis.outputs["Emission"]
 
     if not soft:
         nt.links.new(shaded, out.inputs["Surface"])
         _finish(mat)
         return mat
 
-    uv = nt.nodes.new('ShaderNodeUVMap')
-    uv.uv_map = "UVMap"                    # the kernel UVs, not the atlas
-    uv.location = (-900, -220)
-    dot = nt.nodes.new('ShaderNodeVectorMath')
-    dot.operation = 'DOT_PRODUCT'
-    dot.location = (-720, -220)
-    nt.links.new(uv.outputs["UV"], dot.inputs[0])
-    nt.links.new(uv.outputs["UV"], dot.inputs[1])
-    # alpha = (exp(-4*(u^2+v^2)) - exp(-4)) / (1 - exp(-4)), clamped at 0
-    a4 = _math(nt, 'MULTIPLY', dot.outputs["Value"], 4.0)
-    gauss = _math(nt, 'MAXIMUM',
-                  _math(nt, 'DIVIDE',
-                        _math(nt, 'SUBTRACT',
-                              _math(nt, 'EXPONENT',
-                                    _math(nt, 'MULTIPLY', a4, -1.0)),
-                              _EDGE),
-                        1.0 - _EDGE),
-                  0.0)
-    opac = nt.nodes.new('ShaderNodeAttribute')
-    opac.attribute_name = "Opac"
-    opac.location = (-720, -420)
-    alpha = _math(nt, 'MULTIPLY', gauss, opac.outputs["Fac"])
+    alpha = _soft_alpha(nt, kernel)
 
     transp = nt.nodes.new('ShaderNodeBsdfTransparent')
     transp.location = (-120, -60)
     mix = nt.nodes.new('ShaderNodeMixShader')
     mix.location = (380, 0)
-    # Shadow rays can see a THINNER version of the model than camera rays do.
-    #
-    # This is the knob that makes shadows usable at all. A splat model is a
-    # cloud of overlapping discs, so at full opacity every disc sits in the
-    # shadow of the dozens in front of it and the model renders black - the
-    # failure that forced shadow casting off by default. Scaling alpha down
-    # for shadow rays only lets light penetrate the cloud while the model
-    # still drops a recognisable shadow onto the floor.
-    #
-    # It is a cheat, and deliberately so: the honest alternative is volumetric
-    # transmittance through the whole cloud, which is exactly what a mesh bake
-    # cannot do. Camera rays are untouched, so the model's own appearance is
-    # unchanged whatever this is set to.
-    alpha_out = alpha
-    if float(shadow_strength) < 0.999:
-        lp = nt.nodes.new('ShaderNodeLightPath')
-        lp.location = (-900, -320)
-        drop = _math(nt, 'MULTIPLY', lp.outputs["Is Shadow Ray"],
-                     1.0 - float(shadow_strength))
-        keep = _math(nt, 'SUBTRACT', 1.0, drop)
-        alpha_out = _math(nt, 'MULTIPLY', alpha, keep)
-
-    _lnk(nt, mix.inputs[0], alpha_out)
+    # (1.20.5) The Light Path "Is Shadow Ray" alpha-thinning that lived here
+    # is gone. EEVEE supports the Light Path node only partially, so in the
+    # engine this addon recommends the trick never ran: every disc sat inside
+    # its neighbours' virtual shadow maps, and a lit bake with Cast Shadows
+    # on rendered BLACK while still dropping a crisp floor shadow. Shadow
+    # thinning is now object-level, where EEVEE and Cycles agree: the visible
+    # model never casts (prepare_object) and add_shadow_proxy() carries the
+    # shadow on a camera-invisible twin instead.
+    _lnk(nt, mix.inputs[0], alpha)
     nt.links.new(transp.outputs["BSDF"], mix.inputs[1])
     nt.links.new(shaded, mix.inputs[2])
     nt.links.new(mix.outputs["Shader"], out.inputs["Surface"])
@@ -281,28 +332,192 @@ def _finish(mat):
         pass
 
 
-def prepare_object(obj, cast_shadows=False):
+def build_shadow_material(name, soft, shadow_strength=0.04,
+                          kernel='NORM'):
+    """What the lamps see instead of the real model.
+
+    Alpha is the same kernel gaussian times per-splat opacity as the visible
+    material, multiplied by a plain constant shadow_strength - no Light Path
+    tricks - so EEVEE and Cycles cast the same shadow, and Shadow Strength
+    means exactly one thing: how dense the dropped shadow is. The surface
+    closure is never seen lit (the proxy is camera-invisible); a black
+    diffuse keeps it inert if it ever leaks into a reflection."""
+    mat = bpy.data.materials.new(name + "_shadow")
+    mat.use_nodes = True
+    nt = mat.node_tree
+    for nd in list(nt.nodes):
+        nt.nodes.remove(nd)
+    out = nt.nodes.new('ShaderNodeOutputMaterial')
+    out.location = (600, 0)
+    bsdf = nt.nodes.new('ShaderNodeBsdfDiffuse')
+    bsdf.location = (-120, 120)
+    bsdf.inputs["Color"].default_value = (0.0, 0.0, 0.0, 1.0)
+    transp = nt.nodes.new('ShaderNodeBsdfTransparent')
+    transp.location = (-120, -60)
+    mix = nt.nodes.new('ShaderNodeMixShader')
+    mix.location = (380, 0)
+    s = float(np.clip(shadow_strength, 0.0, 1.0))
+    alpha = (_math(nt, 'MULTIPLY', _soft_alpha(nt, kernel), s)
+             if soft else s)
+    _lnk(nt, mix.inputs[0], alpha)
+    nt.links.new(transp.outputs["BSDF"], mix.inputs[1])
+    nt.links.new(bsdf.outputs["BSDF"], mix.inputs[2])
+    nt.links.new(mix.outputs["Shader"], out.inputs["Surface"])
+    _finish(mat)
+    return mat
+
+
+def add_shadow_proxy(context, obj, soft, shadow_strength,
+                     kernel='NORM'):
+    """Camera-invisible twin of the baked model that carries its shadow.
+
+    Shares the same mesh datablock (zero copy); the shadow material is
+    overridden at the OBJECT level so the visible model keeps its lit
+    material. Ray visibility does the rest: hidden from camera and light
+    bounces, visible to shadow maps only - the object-level mechanism EEVEE
+    moved shadow control to in 4.2, and the one Cycles always had. Displayed
+    as bounds so it neither z-fights its twin in solid shading nor (since
+    4.2 renders bounds-displayed objects) vanishes from rendered shading."""
+    proxy = bpy.data.objects.new(obj.name + "_shadow", obj.data)
+    context.collection.objects.link(proxy)
+    proxy.parent = obj
+    # Tag it, so stale twins can be found and purged (see
+    # purge_stale_proxies). And unlike 1.20.5, it stays SELECTABLE:
+    # deleting a parent does not delete its children in Blender, so an
+    # unselectable twin was guaranteed to outlive its model - and then sit
+    # in every shadow map, silently blackening every later bake made in the
+    # same spot. Found in the field within a day.
+    proxy["fgs_shadow_proxy"] = obj.name
+    mat = build_shadow_material(obj.name, soft,
+                                float(shadow_strength), kernel)
+    for slot in proxy.material_slots:
+        slot.link = 'OBJECT'
+        slot.material = mat
+    for attr, val in (("visible_camera", False),
+                      ("visible_diffuse", False),
+                      ("visible_glossy", False),
+                      ("visible_transmission", False),
+                      ("visible_volume_scatter", False),
+                      ("visible_shadow", True)):
+        try:
+            setattr(proxy, attr, val)
+        except Exception:
+            pass
+    # Shrink the twin 4% about its own centre. At identical scale every
+    # lit-side disc of the model coincides with its caster in the shadow
+    # map - self-shadowing by construction, bias notwithstanding. Pulling
+    # the caster just inside the cloud puts the model's lamp-facing shell
+    # OUTSIDE its own shadow, while the floor shadow shrinks by an
+    # invisible 4%. The interior and far side stay shadowed, which is
+    # where shadow belongs anyway.
+    try:
+        from mathutils import Matrix, Vector
+        corners = [Vector(c) for c in obj.bound_box]
+        centre = sum(corners, Vector()) / 8.0
+        proxy.matrix_world = (Matrix.Translation(centre)
+                              @ Matrix.Scale(0.96, 4)
+                              @ Matrix.Translation(-centre))
+    except Exception:
+        pass
+    try:
+        proxy.display_type = 'BOUNDS'
+    except Exception:
+        pass
+    return proxy
+
+
+def purge_stale_proxies(context):
+    """Remove shadow twins whose model is gone.
+
+    Deleting an object does not delete its children, so a baked model can
+    die while its camera-invisible twin lives on - invisible in renders,
+    easy to miss in the outliner, and still writing itself into every
+    shadow map, which silently blackens any later bake in the same spot.
+    Called before every lit bake; returns how many were removed so the
+    console can say so out loud."""
+    gone = 0
+    for ob in list(context.scene.objects):
+        try:
+            if not ob.get("fgs_shadow_proxy"):
+                continue
+            par = ob.parent
+            if par is None or par.name not in context.scene.objects:
+                bpy.data.objects.remove(ob, do_unlink=True)
+                gone += 1
+        except Exception:
+            pass
+    return gone
+
+
+def describe_lit_environment(context, params):
+    """One honest line about everything that decides whether a lit bake can
+    visibly respond to light, printed with every lit bake. Three rounds of
+    "still dark" taught us the scene state IS the story: sticky operator
+    values, a viewport left in Material Preview, an orphaned shadow twin -
+    none of them visible in the bake report until now. Returns
+    (console_line, [warnings for the status bar])."""
+    lines, warns = [], []
+    eng = str(getattr(context.scene.render, "engine", "?"))
+    lines.append("engine=" + eng)
+    if 'EEVEE' not in eng.upper():
+        warns.append("lit shading targets EEVEE; in " + eng
+                     + " it degrades to a dim ambient look")
+    try:
+        lines.append("view_transform="
+                     + str(context.scene.view_settings.view_transform))
+    except Exception:
+        pass
+    shading = []
+    try:
+        for a in context.screen.areas:
+            if a.type == 'VIEW_3D':
+                sp = a.spaces.active
+                if sp is not None:
+                    shading.append(str(sp.shading.type))
+    except Exception:
+        pass
+    lines.append("viewports=" + (",".join(shading) if shading else "?"))
+    if shading and 'RENDERED' not in shading:
+        warns.append("no viewport is in Rendered shading - scene lamps are "
+                     "not shown in Solid or Material Preview")
+    lamps = []
+    try:
+        for ob in context.scene.objects:
+            if ob.type == 'LIGHT':
+                lamps.append("%s:%s %gW" % (ob.name, ob.data.type,
+                                            float(getattr(ob.data, "energy",
+                                                          0.0))))
+    except Exception:
+        pass
+    lines.append("lamps=[" + ", ".join(lamps) + "]")
+    twins = sum(1 for ob in context.scene.objects
+                if ob.get("fgs_shadow_proxy"))
+    lines.append("shadow_twins=%d" % twins)
+    lines.append("params={" + params + "}")
+    return "; ".join(lines), warns
+
+
+def prepare_object(obj):
     """Object-level settings a lit bake needs.
 
-    SHADOW CASTING IS OFF BY DEFAULT, and that is not an oversight.
+    THE VISIBLE MODEL NEVER CASTS SHADOWS - no longer even optionally.
 
-    A baked splat model is not a surface, it is a cloud of hundreds of
-    thousands of overlapping discs. Let every disc cast a shadow and each one
-    lands in the shadow of the dozens stacked in front of it: light reaches
-    the outer shell and nothing else, and the model renders as a black blob
-    with a faintly lit rim. The emission path already disables shadow casting
-    for the same reason - it calls it the opaque-shadow-blob bug - and the lit
-    path inherited the problem by turning it back on.
-
-    Self-shadowing inside a capture is also double-counting: the shoot's own
-    occlusion is already baked into the colours. What is genuinely wanted is
-    for splats to catch scene lamps, which needs no shadow casting at all.
-
-    Turn it on only when the model must drop a shadow onto other geometry, and
-    expect the model itself to darken considerably when you do.
+    A baked splat model is a cloud of hundreds of thousands of overlapping
+    discs. Let every disc cast and each one lands in the shadow of the dozens
+    stacked in front of it: light reaches the outer shell and nothing else,
+    and the model renders as a black blob with a faintly lit rim. The old
+    escape hatch - thinning the alpha for shadow rays with the Light Path
+    node - turned out to run only in Cycles: EEVEE supports that node only
+    partially, so in the engine this addon actually recommends, the blob was
+    back in full (found the hard way, fixed in 1.20.5). Wanting a shadow is
+    still legitimate, so it moved to where both engines agree - the object
+    level: add_shadow_proxy() puts a camera-invisible twin in the shadow maps
+    instead, and this object stays out of them entirely. Self-shadowing
+    inside a capture was double-counting anyway: the shoot's own occlusion is
+    already baked into the colours.
     """
     try:
-        obj.visible_shadow = bool(cast_shadows)
+        obj.visible_shadow = False
     except Exception:
         pass
     try:
@@ -485,7 +700,7 @@ def surface_normals(centers, quat, scale, grid=None, passes=2):
     centers = np.ascontiguousarray(centers, np.float32)
     try:
         if grid is None:
-            from .spatial import BucketGrid
+            from .splatcore.spatial import BucketGrid
             grid = BucketGrid(centers)
         order, starts = grid.bucket_order()
     except Exception as e:

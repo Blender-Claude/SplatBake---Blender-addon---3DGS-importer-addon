@@ -1,0 +1,16 @@
+SplatBake
+Copyright (c) 2026 Blender-Claude  <https://github.com/Blender-Claude>
+
+The Blender add-on (every module outside splatcore/) is licensed
+GPL-3.0-or-later - see LICENSE. It calls Blender's Python API, and the
+Blender Foundation's position is that published add-ons doing so must be
+shared under a GPL-compatible license; the Blender Extensions platform
+requires SPDX:GPL-3.0-or-later specifically.
+
+The splatcore/ package is licensed Apache-2.0 and is Blender-free - see
+splatcore/LICENSE. It may be used on its own, outside Blender entirely.
+
+Parts of this project were written with the assistance of Claude, an AI
+assistant made by Anthropic, credited here as a tool used in development.
+Copyright in this work is held by the human author behind the maintainer
+account above; an AI cannot hold it.

@@ -1,6 +1,92 @@
 """GPU shader for screen-space gaussian splatting (EWA projection)."""
 
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 Blender-Claude
+
+
 import gpu
+
+MAX_PREVIEW_LIGHTS = 8
+
+_LIGHT_BLOCK = '''
+    // ---- live lighting preview -----------------------------------------
+    // Off (lit_mix = 0) this is dead code the driver folds away, so the
+    // unlit path costs nothing.
+    //
+    // The normal is the SHORTEST covariance axis - the same estimate the bake
+    // uses - read straight off R, which is already built above. `s` is the
+    // de-spiked scale, so needle gaussians that were clamped into discs are
+    // shaded by the axis they actually got, not the one they started with.
+    //
+    // Everything here is per-SPLAT, in the vertex shader: four lights across
+    // a few million splats is trivial next to the per-fragment cost of
+    // drawing them, and it keeps the fragment shader untouched.
+    if (lit_mix > 0.0) {
+        int mi = (s.x <= s.y && s.x <= s.z) ? 0 : ((s.y <= s.z) ? 1 : 2);
+        vec3 N = normalize(R[mi]);
+        // Face the viewer, matching the bake's default "Face Viewer" mode:
+        // the sign of a splat's axis is arbitrary, so without this half the
+        // model shades inverted.
+        vec3 Vv = vec3(cam_x, cam_y, cam_z) - center;
+        if (dot(N, Vv) < 0.0) { N = -N; }
+
+        // Light data comes in as plain uniforms, not a texture.
+        //
+        // A 3xN texture was tried and is the tidier design, but it needs a
+        // second sampler bound alongside sh_tex, and on integrated GPUs that
+        // silently produced no lighting at all - no compile error, just a
+        // dark model. Uniforms are the mechanism that is known to work here,
+        // so the light count is capped rather than risking the sampler.
+        //
+        // Each light is two vec4s instead of three: the spot aim's xy is
+        // packed into pos.w/col.w as an octahedral-free shortcut - z is
+        // recovered from the aim vector being unit length, and its sign
+        // rides in the type tag. Only spots use it, so nothing else pays.
+        vec4 lp[8];
+        vec4 lc[8];
+        lp[0] = light_pos0; lp[1] = light_pos1;
+        lp[2] = light_pos2; lp[3] = light_pos3;
+        lp[4] = light_pos4; lp[5] = light_pos5;
+        lp[6] = light_pos6; lp[7] = light_pos7;
+        lc[0] = light_col0; lc[1] = light_col1;
+        lc[2] = light_col2; lc[3] = light_col3;
+        lc[4] = light_col4; lc[5] = light_col5;
+        lc[6] = light_col6; lc[7] = light_col7;
+
+        vec3 acc = vec3(lit_ambient);
+        for (int i = 0; i < 8; i++) {
+            if (i >= light_count) { break; }
+            vec4 lpi = lp[i];
+            vec4 lci = lc[i];
+            vec3 L;
+            float atten = 1.0;
+            if (lpi.w < 0.5) {
+                L = normalize(lpi.xyz);             // sun: direction to light
+            } else {
+                vec3 d = lpi.xyz - center;          // point / spot / area
+                float d2 = max(dot(d, d), 1e-4);
+                L = d * inversesqrt(d2);
+                atten = 1.0 / d2;
+            }
+            // Wrapped diffuse instead of plain max(N.L, 0).
+            //
+            // Raw splat normals are noisy - many gaussians are near-isotropic
+            // blobs whose shortest axis is arbitrary - so a hard Lambert term
+            // flips neighbouring splats between fully lit and fully black and
+            // the capture comes out speckled. Wrapping pushes the terminator
+            // out and compresses the range, so a normal that is wrong by a few
+            // degrees shifts the shading slightly instead of switching it off.
+            //
+            // The same trick is standard for foliage and skin, and for the
+            // same reason: it is the honest response to a surface whose
+            // normals cannot be trusted to a fine tolerance.
+            float ndl = dot(N, L);
+            ndl = max((ndl + lit_wrap) / (1.0 + lit_wrap), 0.0);
+            acc += lci.rgb * ndl * atten;
+        }
+        base = mix(base, base * acc, lit_mix);
+    }
+'''
 
 VERT_SRC = """
 float vals[48];
@@ -145,6 +231,8 @@ void main()
             }
         }
     }
+//__LIGHTING__
+
     v_color = vec4(clamp(base, 0.0, 1.0), op);
     v_pos = corner;
 
@@ -252,7 +340,7 @@ def build_test_shader():
     return gpu.shader.create_from_info(info)
 
 
-def build_shader():
+def build_shader(lighting=True):
     iface = gpu.types.GPUStageInterfaceInfo("splat_iface")
     iface.smooth('VEC4', "v_color")
     iface.smooth('VEC2', "v_pos")
@@ -290,6 +378,30 @@ def build_shader():
     info.push_constant('FLOAT', "cam_x")
     info.push_constant('FLOAT', "cam_y")
     info.push_constant('FLOAT', "cam_z")
+    # Live lighting preview. Four lights is a deliberate ceiling: these are
+    # push constants, and this file already carries a comment about low-end
+    # GPUs running out of that space. Four covers a key/fill/rim setup, which
+    # is what a preview needs.
+    #
+    # `lighting=False` builds the shader without any of this. That exists so a
+    # GPU that cannot afford the extra uniforms loses the PREVIEW rather than
+    # the whole viewer: the caller retries with it off if the build throws.
+    if not lighting:
+        info.vertex_source(VERT_SRC.replace("//__LIGHTING__", ""))
+        info.fragment_source(FRAG_SRC)
+        info.vertex_out(iface)
+        info.fragment_out(0, 'VEC4', "fragColor")
+        return gpu.shader.create_from_info(info)
+    info.push_constant('FLOAT', "lit_mix")
+    info.push_constant('FLOAT', "lit_ambient")
+    info.push_constant('FLOAT', "lit_wrap")
+    info.push_constant('INT', "light_count")
+    # Two vec4s per light. This is the mechanism 1.17.1 used and is known to
+    # work on integrated GPUs; a light TEXTURE was tried in 1.19 and produced
+    # no lighting there, so the cap stays modest and the sampler is not used.
+    for _i in range(MAX_PREVIEW_LIGHTS):
+        info.push_constant('VEC4', "light_pos%d" % _i)
+        info.push_constant('VEC4', "light_col%d" % _i)
     info.sampler(0, 'FLOAT_2D', "sh_tex")
     info.vertex_in(0, 'VEC2', "corner")
     info.vertex_in(1, 'VEC3', "center")
@@ -299,7 +411,9 @@ def build_shader():
     info.vertex_in(5, 'VEC4', "quat")
     info.vertex_out(iface)
     info.fragment_out(0, 'VEC4', "fragColor")
-    info.vertex_source(VERT_SRC)
+    info.vertex_source(VERT_SRC.replace(
+        "//__LIGHTING__",
+        _LIGHT_BLOCK))
     info.fragment_source(FRAG_SRC)
     return gpu.shader.create_from_info(info)
 

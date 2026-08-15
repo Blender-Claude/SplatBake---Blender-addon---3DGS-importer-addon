@@ -6,9 +6,13 @@ handler, the active model, the box watcher (delete box -> remove model), and the
 global splat-delete history.
 """
 
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 Blender-Claude
+
+
 import bpy
 
-VERSION = "1.16.1"
+VERSION = "1.20.15"
 
 RENDERERS = []          # active SplatRenderer instances
 ACTIVE = None           # the renderer last clicked / loaded
@@ -44,6 +48,7 @@ def draw_params(scene):
         "aniso": scene.fgs_despike,
         "lod": scene.fgs_lod,
         "lod_points": scene.fgs_lod_points,
+        "lit_preview": getattr(scene, "fgs_lit_preview", False),
         "view_transform": scene.view_settings.view_transform,
         "pc_gaussian": scene.fgs_pc_gaussian,
         "sh_quality": scene.fgs_sh_quality,
@@ -591,6 +596,48 @@ def pick_renderer_under_cursor(region, rv3d, mx, my, radius=16.0):
         if t is not None and (hit is None or t < hit[0]):
             hit = (t, r)
     return hit[1] if hit else None
+
+
+def pick_renderer_under_cursor_ray(region, rv3d, mx, my, radius=16.0):
+    """pick_renderer_under_cursor, plus HOW FAR the hit is along the cursor
+    ray in world units, so the caller can compare it against Blender's own
+    scene ray_cast and let whatever is genuinely in front win.
+
+    Distance is measured to the splat CENTRE projected onto the ray (not the
+    clip-space w the picker sorts by), because it has to be comparable with a
+    ray_cast hit distance in both perspective and orthographic views.
+
+    Returns (renderer, distance) or (None, None).
+    """
+    from mathutils import Vector
+    from bpy_extras import view3d_utils
+    origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, (mx, my))
+    direction = view3d_utils.region_2d_to_vector_3d(region, rv3d, (mx, my))
+    live = visible_renderers(getattr(bpy.context, "space_data", None))
+    best = None
+    for r in live:
+        res = r.pick(region, rv3d, mx, my, radius, coarse=True)
+        if res is None:
+            continue
+        try:
+            c = r.centers[int(res[1])]
+            wc = r.model_matrix() @ Vector((float(c[0]), float(c[1]),
+                                            float(c[2])))
+            t = float((wc - origin).dot(direction))
+        except Exception:
+            t = float(res[0])       # clip-space w: still monotonic in depth
+        if best is None or t < best[0]:
+            best = (t, r)
+    if best is not None:
+        return best[1], best[0]
+    hit = None
+    for r in live:
+        t = r.ray_hits_bounds(region, rv3d, mx, my)
+        if t is not None and (hit is None or t < hit[0]):
+            hit = (t, r)
+    if hit is not None:
+        return hit[1], hit[0]
+    return None, None
 
 
 def delete_under_cursor(region, rv3d, mx, my, radius=12.0):

@@ -1,5 +1,9 @@
 """The per-instance splat renderer: GPU buffers, sorting, colour, picking."""
 
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 Blender-Claude
+
+
 import math
 import bpy
 import gpu
@@ -9,12 +13,150 @@ from mathutils import Matrix, Vector
 from .shaders import build_shader, build_point_shader
 
 
+# Why the preview reports its own state: every failure mode here is silent.
+# No lamp, wrong display mode, a lamp type that yields nothing - each looks
+# identical from the viewport (nothing happens), so the reason is recorded and
+# surfaced in the sidebar instead of leaving the user to guess.
+PREVIEW_STATUS = "off"
+
+
+def gather_preview_lights(context, model_inv, limit=4):
+    """Scene lights, converted into a model's local space, for the shader.
+
+    The shader works in MODEL space - `center` is a local coordinate and the
+    matrix it receives is already model x view. Rather than send another mat4
+    and transform millions of splats on the GPU, the handful of lights are
+    transformed once here on the CPU.
+
+    Returns (list of (x,y,z,type) tuples, list of (r,g,b,0) tuples), each
+    padded to `limit`, plus how many are real.
+
+    NOTE ON VISIBILITY: `visible_get()` is deliberately NOT used. It needs a
+    view-layer context, and this runs inside a draw handler where that is
+    restricted - it can raise, and when it did the whole gather was abandoned
+    and the preview silently reported no lights at all. `hide_viewport` and
+    `hide_get()` are plain attributes and safe here.
+
+    Energy uses the SAME conversion the baked material gets from EEVEE, times
+    the shared Light Gain (1.20.12). It used to be arbitrary - 0.5x a sun's
+    strength, 0.0025x a lamp's watts - chosen to look sane, which meant the
+    preview and a bake could never agree no matter how either was tuned. The
+    physical conversions are:
+
+        sun          irradiance E = strength        -> radiance E / pi
+        point/area   E = P / (4 pi d^2)             -> radiance E / pi
+        spot         as point, inside the cone
+
+    The shader divides by d^2 itself, so the point/spot/area constant folded
+    in here is 1 / (4 pi^2). What is left is a plain diffuse response, which
+    is what the lit bake computes as well - so the same lamp now reads the
+    same in both, and Light Gain moves both together.
+    """
+    gain = 3.0
+    try:
+        gain = float(getattr(context.scene, "fgs_lit_preview_gain", 3.0))
+    except Exception:
+        pass
+    _SUN_K = 0.3183098861837907          # 1 / pi
+    _PT_K = 0.02533029591058444          # 1 / (4 * pi^2)
+    global PREVIEW_STATUS
+    pos = []
+    col = []
+    aims = []
+    lamps = []
+    try:
+        for ob in context.scene.objects:
+            if ob.type != 'LIGHT':
+                continue
+            try:
+                if ob.hide_viewport or ob.hide_get():
+                    continue
+            except Exception:
+                pass
+            lamps.append(ob)
+    except Exception as e:
+        PREVIEW_STATUS = "could not read scene lights"
+        lamps = []
+
+    # With more than `limit` lamps, take the ones that actually matter rather
+    # than whichever happen to come first in the scene. Rough contribution:
+    # suns are global, everything else falls off with distance.
+    try:
+        origin = model_inv.inverted().translation
+        def _weight(o):
+            ld = o.data
+            e = abs(float(getattr(ld, "energy", 1.0)))
+            if ld.type == 'SUN':
+                return 1e9 + e
+            d2 = max((o.matrix_world.translation - origin).length_squared, 1e-4)
+            return e / d2
+        lamps.sort(key=_weight, reverse=True)
+    except Exception:
+        pass
+
+    for ob in lamps[:limit]:
+        try:
+            ld = ob.data
+            c = tuple(ld.color)
+            e = float(getattr(ld, "energy", 1.0))
+            aim = (0.0, 0.0, -1.0, -1.0)
+            cos_inner = 0.0
+            if ld.type == 'SUN':
+                # A lamp's local -Z points where it shines, so +Z is the
+                # direction TO the light, which is what the shader wants.
+                d = ob.matrix_world.to_3x3() @ Vector((0.0, 0.0, 1.0))
+                d = (model_inv.to_3x3() @ d).normalized()
+                pos.append((d.x, d.y, d.z, 0.0))
+                # Sun strength is irradiance, already independent of distance.
+                k = e * _SUN_K * gain
+            else:
+                p = model_inv @ ob.matrix_world.translation
+                if ld.type == 'SPOT':
+                    # Direction the lamp points, i.e. local -Z.
+                    a = ob.matrix_world.to_3x3() @ Vector((0.0, 0.0, -1.0))
+                    a = (model_inv.to_3x3() @ a).normalized()
+                    size = float(getattr(ld, "spot_size", 1.5))      # full angle
+                    blend = float(getattr(ld, "spot_blend", 0.15))
+                    cos_outer = math.cos(min(size * 0.5, 3.14159 * 0.5))
+                    # Blender's blend widens the soft edge inward from the rim.
+                    cos_inner = math.cos(
+                        min(size * 0.5 * (1.0 - blend), 3.14159 * 0.5))
+                    aim = (a.x, a.y, a.z, cos_outer)
+                    pos.append((p.x, p.y, p.z, 2.0))
+                else:
+                    # POINT and AREA share the inverse-square treatment. An
+                    # area lamp is really an emitting surface, so a point
+                    # approximation makes it harsher than it should be - the
+                    # softness slider is the practical compensation, and the
+                    # bake is what to trust for the real falloff.
+                    pos.append((p.x, p.y, p.z, 1.0))
+                # Divided by distance squared in the shader, so the watts
+                # carry the 1/(4 pi) intensity conversion and the 1/pi
+                # diffuse response only.
+                k = e * _PT_K * gain
+            col.append((c[0] * k, c[1] * k, c[2] * k, cos_inner))
+            aims.append(aim)
+        except Exception:
+            continue
+
+    n = len(col)
+    while len(pos) < limit:
+        pos.append((0.0, 0.0, 1.0, 0.0))
+        col.append((0.0, 0.0, 0.0, 0.0))
+        aims.append((0.0, 0.0, -1.0, -1.0))
+    if n == 0 and PREVIEW_STATUS not in ("could not read scene lights",):
+        PREVIEW_STATUS = "no lights in scene"
+    return pos, col, aims, n
+
+
 class SplatRenderer:
     _CORNERS = np.array([[-2, -2], [2, -2], [2, 2], [-2, 2]], dtype=np.float32)
     _TRI = np.array([0, 1, 2, 0, 2, 3], dtype=np.int32)
     _COS_THRESH = math.cos(math.radians(1.5))
     _MAX_FRAMES = 25
     _shared_shader = None     # one shader shared by every instance
+    _shader_has_lighting = True
+    _shader_error = ""
     _shared_point_shader = None
 
     def __init__(self, data, box_name, rest_inv, share_from=None):
@@ -44,7 +186,7 @@ class SplatRenderer:
         # Outlier-trimmed bounds: sky/floater splats must not inflate framing,
         # the transform handle, or the depth-sort pivot. _aabb above stays on
         # the FULL bounds so frustum culling remains conservative.
-        from .loaders import robust_bounds
+        from .splatcore.loaders import robust_bounds
         tlo, thi = robust_bounds(self.centers)
         self.center_local = Vector(((tlo + thi) * 0.5).tolist())  # sort pivot
         self.half = Vector(((thi - tlo) * 0.5).tolist())          # for offsets
@@ -66,7 +208,22 @@ class SplatRenderer:
         self.box_name = box_name      # proxy Empty drives the transform
         self.rest_inv = rest_inv
         if SplatRenderer._shared_shader is None:
-            SplatRenderer._shared_shader = build_shader()
+            # Try the lighting-capable shader first; if the GPU cannot afford
+            # its extra uniforms, lose the preview rather than the viewer.
+            try:
+                SplatRenderer._shared_shader = build_shader(lighting=True)
+                SplatRenderer._shader_has_lighting = True
+            except Exception as e:
+                # This fallback hid a real bug once: a shader that failed to
+                # compile fell back silently, so the preview just did nothing
+                # and looked like a logic error rather than a build error.
+                # Keep the message so the next failure is findable.
+                SplatRenderer._shader_error = str(e)
+                print("[SplatBake] LIGHTING SHADER FAILED TO COMPILE:", e)
+                print("[SplatBake] falling back to the unlit shader; "
+                      "the lighting preview will do nothing.")
+                SplatRenderer._shared_shader = build_shader(lighting=False)
+                SplatRenderer._shader_has_lighting = False
         self.shader = SplatRenderer._shared_shader
         self._perm = np.random.default_rng(0).permutation(self.N)
         self._tris_tmpl = None        # (N,6) index template, built lazily
@@ -221,7 +378,7 @@ class SplatRenderer:
             self._grid_failed = True
             return None
         try:
-            from .spatial import BucketGrid
+            from .splatcore.spatial import BucketGrid
             self._grid = BucketGrid(self.centers, self.cull_r)
         except Exception as e:
             # A failed grid must never cost the user their viewport: fall back
@@ -649,7 +806,15 @@ class SplatRenderer:
             if view_pos is not None:
                 d = (view_pos - (self.model_matrix() @ self.center_local)).length
                 density = max(1.0, round(density * self._lod_factor(d)))
-                if p.get("lod_points") and d > 30.0 and mode == 'SPLAT':
+                # Distance LOD swaps far models to the point shader, which
+                # has no normals and therefore no lighting. On a large scene
+                # the model centre is almost always past this threshold, so
+                # with the preview on this silently turned the whole capture
+                # unlit - the reported "works on small objects, not on big
+                # scenes". Lighting preview wins over the LOD swap; it is an
+                # explicit, temporary mode and the user asked to see light.
+                if (p.get("lod_points") and d > 30.0 and mode == 'SPLAT'
+                        and not p.get("lit_preview")):
                     mode = 'POINTS'
 
         if batch_override is not None:
@@ -751,6 +916,45 @@ class SplatRenderer:
         s.uniform_float("cam_x", cam_local.x)
         s.uniform_float("cam_y", cam_local.y)
         s.uniform_float("cam_z", cam_local.z)
+        # Live lighting preview. Any failure must not take the viewport with
+        # it: on error this falls back to unlit, which is the old behaviour.
+        global PREVIEW_STATUS
+        lit_mix = 0.0
+        from .shaders import MAX_PREVIEW_LIGHTS as _LMAX
+        lpos = [(0.0, 0.0, 1.0, 0.0)] * _LMAX
+        lcol = [(0.0, 0.0, 0.0, 0.0)] * _LMAX
+        laim = [(0.0, 0.0, -1.0, -1.0)] * _LMAX
+        lnum = 0
+        try:
+            scn = bpy.context.scene
+            if (bool(getattr(scn, "fgs_lit_preview", False))
+                    and SplatRenderer._shader_has_lighting):
+                lpos, lcol, laim, lnum = gather_preview_lights(
+                    bpy.context, self.model_matrix().inverted(), _LMAX)
+                if lnum > 0:
+                    lit_mix = float(getattr(scn, "fgs_lit_preview_mix", 1.0))
+                    PREVIEW_STATUS = "lighting %d lamp%s" % (
+                        lnum, "" if lnum == 1 else "s")
+            elif not SplatRenderer._shader_has_lighting:
+                PREVIEW_STATUS = ("shader compile failed: %s"
+                                  % (SplatRenderer._shader_error or "unknown"))
+            else:
+                PREVIEW_STATUS = "off"
+        except Exception as e:
+            PREVIEW_STATUS = "error: %s" % e
+            lit_mix = 0.0
+        try:
+            s.uniform_float("lit_mix", lit_mix)
+            s.uniform_float("lit_ambient", float(getattr(
+                bpy.context.scene, "fgs_lit_preview_ambient", 0.15)))
+            s.uniform_float("lit_wrap", float(getattr(
+                bpy.context.scene, "fgs_lit_preview_wrap", 0.5)))
+            s.uniform_int("light_count", int(lnum))
+            for i in range(len(lpos)):
+                s.uniform_float("light_pos%d" % i, lpos[i])
+                s.uniform_float("light_col%d" % i, lcol[i])
+        except Exception as e:
+            PREVIEW_STATUS = "shader has no lighting uniforms (%s)" % e
         s.uniform_sampler("sh_tex",
                           self.sh_tex if self.sh_tex is not None
                           else SplatRenderer._dummy_sh_tex())

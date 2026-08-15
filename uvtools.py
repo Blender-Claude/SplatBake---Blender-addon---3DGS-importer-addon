@@ -1,3 +1,8 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 Blender-Claude
+# NOTE (1.20.4): currently unused - the experimental solid-surface bake,
+# the only caller of this module, is parked in operators.py. Kept intact
+# for its return; nothing imports it until then.
 """UV mapping for baked splat meshes.
 
 Self-contained, like lighting.py: nothing else imports from here except the

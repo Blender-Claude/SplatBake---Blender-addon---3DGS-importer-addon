@@ -1,0 +1,16 @@
+splatcore
+Copyright (c) 2026 Blender-Claude
+
+Licensed under the Apache License, Version 2.0 (see LICENSE in this
+directory). You may obtain a copy at:
+
+    https://www.apache.org/licenses/LICENSE-2.0
+
+This package is Blender-free by design and may be used on its own. It ships
+inside the SplatBake Blender add-on, whose Blender-facing half is licensed
+GPL-3.0-or-later; that combination is permitted because Apache-2.0 code may
+be incorporated into a GPLv3 work. The reverse does not hold, so no
+GPL-licensed code may be added to this package.
+
+Portions of this package were written with the assistance of Claude, an AI
+assistant made by Anthropic.

@@ -6,6 +6,10 @@ Native Blender G/R/S (with X/Y/Z constraints) work on the selected box; the
 and a custom click-and-drag tool is also provided.
 """
 
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 Blender-Claude
+
+
 import os
 import math
 import bpy
@@ -16,7 +20,8 @@ from bpy_extras.io_utils import ImportHelper
 from bpy_extras import view3d_utils
 from bpy.types import Operator
 
-from . import loaders, boxes, state
+from . import boxes, state
+from .splatcore import loaders
 from .renderer import SplatRenderer
 
 
@@ -74,6 +79,16 @@ class FGS_OT_load(Operator, ImportHelper):
              "surfaces two or three times over. Complete, but heavier and "
              "hazier than the recommended merge"),
         ])
+    true_scale: BoolProperty(
+        name="True Scale (1:1 handle)", default=False,
+        description="Give the model's handle a clean identity transform - "
+                    "Scale (1,1,1) at the model centre - so the file's units "
+                    "pass through 1:1 and the sidebar reads true. Unticked "
+                    "(the current behaviour), the handle is scaled to frame "
+                    "the cloud, which is handy for grabbing but shows the "
+                    "half-extents as its Scale - and clearing that scale "
+                    "squashes the model. The model appears at the same size "
+                    "either way")
     upright: BoolProperty(
         name="Rotate Upright (Y+ to Z+)", default=True,
         description="Rotate +90 deg about X so a Y-up capture stands up in "
@@ -119,7 +134,8 @@ class FGS_OT_load(Operator, ImportHelper):
             base = os.path.splitext(os.path.basename(self.filepath))[0] or "Splat"
             box_name, rest_inv = boxes.make_box(context, data["xyz"],
                                                 show=context.scene.fgs_show_bbox,
-                                                name=base)
+                                                name=base,
+                                                true_scale=self.true_scale)
             r = SplatRenderer(data, box_name, rest_inv)
         except Exception as e:
             self.report({"ERROR"}, f"GPU setup failed: {e}")
@@ -141,6 +157,7 @@ class FGS_OT_load(Operator, ImportHelper):
         try:
             from . import persist
             persist.remember(r, self.filepath, {
+                "true_scale": self.true_scale,
                 "use_sh": self.use_sh,
                 "max_points": self.max_points,
                 "weighted": self.weighted,
@@ -205,9 +222,12 @@ class FGS_OT_load(Operator, ImportHelper):
                         rv3d.view_location = (mn + mx) * 0.5
                         rv3d.view_distance = max((mx - mn).length * 0.85, 0.05)
                     # big scans exceed the default 1000 clip end: extend so
-                    # background splats are not cut off
-                    if raw_diag > 0 and sp.clip_end < raw_diag * 2.0:
-                        sp.clip_end = min(raw_diag * 2.0, 200000.0)
+                    # background splats are not cut off. x4 the raw diagonal
+                    # (not x2): orbiting around a scene puts the camera up to
+                    # a diagonal away from the far side, and the sky splats
+                    # in streamed scenes sit at the raw bounds' very edge.
+                    if raw_diag > 0 and sp.clip_end < raw_diag * 4.0:
+                        sp.clip_end = min(raw_diag * 4.0, 500000.0)
         except Exception:
             pass
         state.tag_redraw(context)
@@ -331,6 +351,18 @@ class FGS_OT_copy(Operator):
                       "clipboard, ready to paste with Ctrl+V")
 
     def execute(self, context):
+        # (1.20.11) Copy follows the ACTIVE object. The fallback to the
+        # active splat model made Ctrl+C hijack copies of ordinary objects:
+        # with a cube selected, no handle was selected, the fallback grabbed
+        # the splat anyway, and FINISHED swallowed the key - copy a cube,
+        # paste a splat. If the active object is not a splat handle, this is
+        # not our copy: hands off, and drop our clipboard so the following
+        # Ctrl+V is Blender's own paste too (last copy wins).
+        act = context.view_layer.objects.active
+        handles = {r.box_name for r in state.RENDERERS}
+        if act is not None and act.select_get() and act.name not in handles:
+            _CLIPBOARD.clear()
+            return {'PASS_THROUGH'}
         rs = _selected_renderers(context)
         if not rs:
             # Nothing of ours selected - let Blender's own copy run instead.
@@ -811,7 +843,91 @@ def _color_atlas(name, col):
     return img, uv
 
 
-def _bake_material(name, soft, sc, live_rinv=None, color_img=None):
+def _aa_camera(context, r):
+    """(modelview, fx, fy, is_persp) for AA compensation, from the scene
+    camera at render resolution if there is one, else the current viewport -
+    the same choice the CAMERA colour mode makes, so colour and opacity are
+    frozen for one consistent viewpoint. Returns None if neither exists."""
+    try:
+        cam = context.scene.camera
+        if cam is not None:
+            rd = context.scene.render
+            w = rd.resolution_x * rd.resolution_percentage / 100.0
+            h = rd.resolution_y * rd.resolution_percentage / 100.0
+            dg = context.evaluated_depsgraph_get()
+            proj = cam.calc_matrix_camera(dg, x=int(w), y=int(h))
+            mv = cam.matrix_world.inverted() @ r.model_matrix()
+            return (np.array(mv, np.float32), 0.5 * w * proj[0][0],
+                    0.5 * h * proj[1][1],
+                    getattr(cam.data, "type", 'PERSP') == 'PERSP')
+        for a in context.screen.areas:
+            if a.type != 'VIEW_3D':
+                continue
+            rv = a.spaces.active.region_3d
+            reg = next((rg for rg in a.regions if rg.type == 'WINDOW'), None)
+            if rv is None or reg is None:
+                continue
+            mv = rv.view_matrix @ r.model_matrix()
+            return (np.array(mv, np.float32),
+                    0.5 * reg.width * rv.window_matrix[0][0],
+                    0.5 * reg.height * rv.window_matrix[1][1],
+                    bool(rv.is_perspective))
+    except Exception as e:
+        print("[SplatBake] AA camera unavailable:", e)
+    return None
+
+
+def _aa_factors(centers, quat, scale, mv, fx, fy, is_persp):
+    """The viewport's antiAlias opacity compensation, in numpy.
+
+    Same formula as the shader: project each splat's 3D covariance to 2D,
+    dilate it by the reference viewer's +0.3 px, and scale opacity by
+    sqrt(det_original / det_dilated). The dilation matters most for splats
+    that land smaller than a pixel, so the effect is a gentle fade of distant
+    splats and no change at all up close - which is exactly what the toggle
+    does live.
+
+    It is VIEW-DEPENDENT, like the SH colour: the bake freezes it for the
+    chosen camera. Returns an (N,) multiplier in [0,1].
+    """
+    n = len(centers)
+    w = quat[:, 0]; x = quat[:, 1]; y = quat[:, 2]; z = quat[:, 3]
+    R = np.empty((n, 3, 3), np.float32)
+    R[:, 0, 0] = 1 - 2 * (y * y + z * z)
+    R[:, 0, 1] = 2 * (x * y - w * z)
+    R[:, 0, 2] = 2 * (x * z + w * y)
+    R[:, 1, 0] = 2 * (x * y + w * z)
+    R[:, 1, 1] = 1 - 2 * (x * x + z * z)
+    R[:, 1, 2] = 2 * (y * z - w * x)
+    R[:, 2, 0] = 2 * (x * z - w * y)
+    R[:, 2, 1] = 2 * (y * z + w * x)
+    R[:, 2, 2] = 1 - 2 * (x * x + y * y)
+    M = R * scale[:, None, :]                     # R @ diag(scale)
+    Sig = M @ np.transpose(M, (0, 2, 1))          # 3D covariance
+    Wm = np.asarray(mv, np.float32)[:3, :3]
+    Sig_c = Wm @ Sig @ Wm.T
+    p = centers @ Wm.T + np.asarray(mv, np.float32)[:3, 3]
+    zc = np.where(np.abs(p[:, 2]) < 1e-6, 1e-6, p[:, 2])
+    J = np.zeros((n, 3, 3), np.float32)
+    if is_persp:
+        J[:, 0, 0] = fx / zc
+        J[:, 0, 2] = -fx * p[:, 0] / (zc * zc)
+        J[:, 1, 1] = fy / zc
+        J[:, 1, 2] = -fy * p[:, 1] / (zc * zc)
+    else:
+        J[:, 0, 0] = fx
+        J[:, 1, 1] = fy
+    cov = J @ Sig_c @ np.transpose(J, (0, 2, 1))
+    a0 = cov[:, 0, 0]; c0 = cov[:, 1, 1]; b = cov[:, 0, 1]
+    det0 = a0 * c0 - b * b
+    a = a0 + 0.3; c = c0 + 0.3                    # reference dilation
+    D = a * c - b * b
+    return np.sqrt(np.clip(det0 / np.maximum(D, 1e-9),
+                           0.0, 1.0)).astype(np.float32)
+
+
+def _bake_material(name, soft, sc, live_rinv=None, color_img=None,
+                   kernel='NORM'):
     """Emission material for baked splats.
 
     soft      : radial gaussian alpha times per-splat opacity, using the
@@ -857,19 +973,22 @@ def _bake_material(name, soft, sc, live_rinv=None, color_img=None):
     uv = nt.nodes.new('ShaderNodeUVMap')
     uv.uv_map = "UVMap"
     # A = 4 * (u^2 + v^2): quad edge = A 4, matching the viewport quads.
-    # alpha = (exp(-A) - exp(-4)) / (1 - exp(-4)) -- reference-exact
-    # normalised gaussian, identical to the viewport's 'PC' kernel.
+    # 'NORM'  : alpha = (exp(-A) - exp(-4)) / (1 - exp(-4)) - the viewport's
+    #           normalised 'PC' / 'V215' kernel, exactly zero at the quad edge.
+    # 'PLAIN' : alpha = exp(-A) - the viewport's 'SOFT (classic Blender)'
+    #           kernel, which never quite reaches zero and so reads softer.
     a4 = _math(nt, 'MULTIPLY',
                _vmath(nt, 'DOT_PRODUCT', uv.outputs["UV"], uv.outputs["UV"]),
                4.0)
-    gauss = _math(nt, 'MAXIMUM',
-                  _math(nt, 'DIVIDE',
-                        _math(nt, 'SUBTRACT',
-                              _math(nt, 'EXPONENT',
-                                    _math(nt, 'MULTIPLY', a4, -1.0)),
-                              _BAKE_EDGE),
-                        1.0 - _BAKE_EDGE),
-                  0.0)
+    falloff = _math(nt, 'EXPONENT', _math(nt, 'MULTIPLY', a4, -1.0))
+    if kernel == 'PLAIN':
+        gauss = falloff
+    else:
+        gauss = _math(nt, 'MAXIMUM',
+                      _math(nt, 'DIVIDE',
+                            _math(nt, 'SUBTRACT', falloff, _BAKE_EDGE),
+                            1.0 - _BAKE_EDGE),
+                      0.0)
     opac = nt.nodes.new('ShaderNodeAttribute')
     opac.attribute_name = "Opac"
     alpha = _math(nt, 'MULTIPLY', gauss, opac.outputs["Fac"])
@@ -1047,11 +1166,11 @@ def _fast_tri_mesh(name, verts, tris):
     return mesh
 
 
-def _bake_cards(r, context, cap, soft=True, boost=1.0, min_opacity=0.0,
+def _bake_cards(r, context, cap_pct, soft=True, boost=1.0, min_opacity=0.0,
                 sh_mode='BASE', cam_world=None, use_texture=True, lit=False,
                 delight=0.0, emission_mix=0.0, cast_shadows=False,
                 normal_mode='CAMERA', shadow_strength=1.0,
-                align_discs=True):
+                light_gain=3.0, sh_k=None, kernel='NORM', aa_view=None):
     """Build a renderable mesh for the active model: one gaussian disc per
     splat (2 triangles), sized and soft-clipped exactly like the viewport
     quads. Colour detail depends on sh_mode:
@@ -1066,6 +1185,13 @@ def _bake_cards(r, context, cap, soft=True, boost=1.0, min_opacity=0.0,
     idx = np.where(r.alive)[0]
     if len(idx) == 0:
         raise RuntimeError("model has no live splats")
+
+    # Percentage of THIS model's live splats (1.20.9): the old absolute cap
+    # meant one number for every model - starving a big scan at the same
+    # setting that was meaninglessly generous for a small one. The share is
+    # taken of the live count, so 100% bakes exactly what the viewport
+    # displays.
+    cap = max(1, int(round(len(idx) * float(cap_pct) / 100.0)))
 
     op_full = src.get("opacity")
     # Near-invisible splats cost a transparency hit per ray but contribute
@@ -1107,27 +1233,40 @@ def _bake_cards(r, context, cap, soft=True, boost=1.0, min_opacity=0.0,
     opacity = (np.clip(op_full[idx].astype(np.float32), 0.0, 1.0)
                if op_full is not None else np.ones(n, np.float32))
     opacity = np.clip(opacity * float(boost), 0.0, 1.0)
+    if aa_view is not None:
+        # The preview's AA compensation is a per-splat opacity factor, so it
+        # bakes exactly - frozen for the chosen camera, like the SH colour.
+        try:
+            mv, fx, fy, is_persp = aa_view
+            opacity = np.clip(
+                opacity * _aa_factors(centers, quat,
+                                      src["scale"][idx].astype(np.float32),
+                                      mv, fx, fy, is_persp), 0.0, 1.0)
+        except Exception as e:
+            print("[SplatBake] AA compensation skipped:", e)
 
     # Lit bakes need consistently oriented normals; the emission path does not
     # use normals at all, so it keeps the cheaper unoriented winding.
+    #
+    # (1.20.10) "Align Discs to Surface" was removed here. It re-seated every
+    # disc into the smoothed surface plane, and under the OLD physical
+    # lighting model that was the difference between lighting working and
+    # not. Under the preview-matched model (1.20.7) it became the opposite:
+    # coherently oriented, elongated discs each shaded with one uniform tint
+    # read as literal brushstrokes on the model, while the raw orientations
+    # produce fine-grained variance that blends like the capture's own fuzz.
+    # Found by the user isolating the toggle. Consistent outward WINDING
+    # stays (radial from the model centre) - True Orientation depends on it,
+    # and _disc_geometry keeps its align_normal input for the day a gentler
+    # blend earns its way back.
     orient_to = None
-    align_normal = None
     if lit:
-        from .loaders import robust_bounds
+        from .splatcore.loaders import robust_bounds
         _lo, _hi = robust_bounds(centers)
         orient_to = ((_lo + _hi) * 0.5).astype(np.float32)
-        if align_discs:
-            try:
-                from . import lighting as _ln
-                align_normal = _ln.surface_normals(
-                    centers, quat, src["scale"][idx].astype(np.float32))
-                orient_to = None
-            except Exception as e:
-                print("[SplatBake] surface alignment failed:", e)
     verts, faces, uvs = _disc_geometry(centers, quat, src["scale"][idx],
                                        sc.fgs_despike, sc.fgs_splat_scale,
-                                       orient_to=orient_to,
-                                       align_normal=align_normal)
+                                       orient_to=orient_to)
     M = np.array(r.model_matrix(), dtype=np.float32)
     vh = np.concatenate([verts, np.ones((4 * n, 1), np.float32)], axis=1)
     world = (vh @ M.T)[:, :3]
@@ -1135,12 +1274,18 @@ def _bake_cards(r, context, cap, soft=True, boost=1.0, min_opacity=0.0,
     # -- colour, per mode ---------------------------------------------
     if mode == 'CAMERA':
         try:
-            from . import sh as _shmod
+            from .splatcore import sh as _shmod
             cw = cam_world if cam_world is not None else Vector((0.0, 0.0, 0.0))
             cam_local = r.model_matrix().inverted() @ Vector(cw)
             cl = np.array((cam_local.x, cam_local.y, cam_local.z), np.float32)
+            shc = r.sh[idx].astype(np.float32)
+            if sh_k is not None:
+                # Match the preview's View Colour Quality: eval_sh reads the
+                # degree straight off the coefficient count, so slicing IS
+                # the quality setting (0 / 3 / 8 / 15 coefficients).
+                shc = shc[:, :int(sh_k), :]
             rgb_view = _shmod.eval_sh(centers, r.dc[idx].astype(np.float32),
-                                      r.sh[idx].astype(np.float32), cl)
+                                      shc, cl)
             col = _grade_np(rgb_view, sc)
         except Exception as e:
             # Never lose the whole bake over the optional colour refinement.
@@ -1221,16 +1366,33 @@ def _bake_cards(r, context, cap, soft=True, boost=1.0, min_opacity=0.0,
                                         atlas_uv=_ATLAS_UV,
                                         emission_mix=float(emission_mix),
                                         normal_mode=normal_mode,
-                                        shadow_strength=float(shadow_strength)))
+                                        kernel=kernel,
+                                        ambient=float(getattr(
+                                            sc, "fgs_lit_preview_ambient",
+                                            0.15)),
+                                        gain=float(light_gain)))
     else:
         mesh.materials.append(
-            _bake_material(nm, soft, sc, live_rinv, color_img))
+            _bake_material(nm, soft, sc, live_rinv, color_img,
+                           kernel=kernel))
 
     obj = bpy.data.objects.new(nm, mesh)
     context.collection.objects.link(obj)
     if lit:
         from . import lighting
-        lighting.prepare_object(obj, cast_shadows=bool(cast_shadows))
+        stale = lighting.purge_stale_proxies(context)
+        if stale:
+            print(f"[SplatBake] removed {stale} stale shadow twin(s) left "
+                  "behind by deleted bakes - they were darkening everything "
+                  "baked in the same spot")
+        lighting.prepare_object(obj)
+        if cast_shadows:
+            # The shadow rides on a camera-invisible twin, so the visible
+            # model can never self-shadow - in either engine. (1.20.5: the
+            # old Light Path thinning silently never ran in EEVEE and the
+            # model went black; see lighting.add_shadow_proxy.)
+            lighting.add_shadow_proxy(context, obj, soft,
+                                      float(shadow_strength), kernel)
     else:
         try:
             # Emission splats are baked radiance: they must not cast shadows.
@@ -1245,68 +1407,74 @@ def _bake_cards(r, context, cap, soft=True, boost=1.0, min_opacity=0.0,
     return obj, n, mode, (color_img is not None)
 
 
-class FGS_OT_light_setup(Operator):
-    """One click that removes every variable between a lit bake and seeing it.
-
-    Across a lot of debugging, a lit bake that looked broken has turned out to
-    be one of: the render engine set to Cycles on a CPU (never converges), the
-    viewport left in Solid or Material Preview (materials not shown, or lit by
-    a studio HDRI that ignores your lamps), or simply no lamp in the scene.
-    Each is invisible from the render, and each looks exactly like a bug.
-
-    Rather than ask someone to check four things in three editors, set all of
-    them at once and report what changed.
-    """
-    bl_idname = "fgs.light_setup"
-    bl_label = "Set Up Lighting Test"
-    bl_description = ("Switch to EEVEE, add a sun if the scene has no lamp, "
-                      "and set the viewport to Rendered - so a lit bake can "
-                      "actually be seen")
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        done = []
-        scn = context.scene
-        try:
-            eng = str(scn.render.engine).upper()
-            if 'EEVEE' not in eng:
-                for name in ('BLENDER_EEVEE_NEXT', 'BLENDER_EEVEE'):
-                    try:
-                        scn.render.engine = name
-                        done.append("engine -> EEVEE")
-                        break
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-
-        if not any(o.type == 'LIGHT' for o in scn.objects):
-            try:
-                ld = bpy.data.lights.new("SplatBake Sun", 'SUN')
-                ld.energy = 3.0
-                sun = bpy.data.objects.new("SplatBake Sun", ld)
-                scn.collection.objects.link(sun)
-                sun.rotation_euler = (0.6, 0.0, 0.8)
-                done.append("added a sun")
-            except Exception:
-                pass
-
-        # Rendered shading, in every 3D viewport that is open - the setting is
-        # per-space, so changing only the active one leaves the others wrong.
-        try:
-            for area in context.screen.areas:
-                if area.type == 'VIEW_3D':
-                    for sp in area.spaces:
-                        if sp.type == 'VIEW_3D':
-                            sp.shading.type = 'RENDERED'
-            done.append("viewport -> Rendered")
-        except Exception:
-            pass
-
-        self.report({'INFO'}, "Lighting test: " + (", ".join(done) or "already set"))
-        return {'FINISHED'}
-
-
+# ---------------------------------------------------------------------------
+# EXPERIMENTAL - PARKED in 1.20.4, together with the solid-surface bake.
+# "Set Up Lighting Test" existed to sanity-check lit SOLID bakes; it is
+# hidden with them. The disc bake ("Bake Discs") does not use it. To bring
+# it back: un-comment this class, its entry in `classes`, and its ui.py row.
+# ---------------------------------------------------------------------------
+# class FGS_OT_light_setup(Operator):
+#     """One click that removes every variable between a lit bake and seeing it.
+#
+#     Across a lot of debugging, a lit bake that looked broken has turned out to
+#     be one of: the render engine set to Cycles on a CPU (never converges), the
+#     viewport left in Solid or Material Preview (materials not shown, or lit by
+#     a studio HDRI that ignores your lamps), or simply no lamp in the scene.
+#     Each is invisible from the render, and each looks exactly like a bug.
+#
+#     Rather than ask someone to check four things in three editors, set all of
+#     them at once and report what changed.
+#     """
+#     bl_idname = "fgs.light_setup"
+#     bl_label = "Set Up Lighting Test"
+#     bl_description = ("Switch to EEVEE, add a sun if the scene has no lamp, "
+#                       "and set the viewport to Rendered - so a lit bake can "
+#                       "actually be seen")
+#     bl_options = {'REGISTER', 'UNDO'}
+#
+#     def execute(self, context):
+#         done = []
+#         scn = context.scene
+#         try:
+#             eng = str(scn.render.engine).upper()
+#             if 'EEVEE' not in eng:
+#                 for name in ('BLENDER_EEVEE_NEXT', 'BLENDER_EEVEE'):
+#                     try:
+#                         scn.render.engine = name
+#                         done.append("engine -> EEVEE")
+#                         break
+#                     except Exception:
+#                         continue
+#         except Exception:
+#             pass
+#
+#         if not any(o.type == 'LIGHT' for o in scn.objects):
+#             try:
+#                 ld = bpy.data.lights.new("SplatBake Sun", 'SUN')
+#                 ld.energy = 3.0
+#                 sun = bpy.data.objects.new("SplatBake Sun", ld)
+#                 scn.collection.objects.link(sun)
+#                 sun.rotation_euler = (0.6, 0.0, 0.8)
+#                 done.append("added a sun")
+#             except Exception:
+#                 pass
+#
+#         # Rendered shading, in every 3D viewport that is open - the setting is
+#         # per-space, so changing only the active one leaves the others wrong.
+#         try:
+#             for area in context.screen.areas:
+#                 if area.type == 'VIEW_3D':
+#                     for sp in area.spaces:
+#                         if sp.type == 'VIEW_3D':
+#                             sp.shading.type = 'RENDERED'
+#             done.append("viewport -> Rendered")
+#         except Exception:
+#             pass
+#
+#         self.report({'INFO'}, "Lighting test: " + (", ".join(done) or "already set"))
+#         return {'FINISHED'}
+#
+#
 class FGS_OT_bake(Operator):
     bl_idname = "fgs.bake_mesh"
     bl_label = "Bake to Mesh (render)"
@@ -1315,12 +1483,15 @@ class FGS_OT_bake(Operator):
                      "appears in F12 renders: one emission gaussian disc per "
                      "splat, kernel-matched to the viewport. Colour Detail "
                      "picks flat, camera-baked full SH, or live degree-1 SH")
-    cap: IntProperty(
-        name="Max Splats", default=200000, min=1000, max=4000000,
-        description="Upper limit of splats to bake (each becomes 2 triangles). "
-                    "When over budget, splats are kept by opacity importance "
-                    "so solid structure survives. Raise for maximum detail if "
-                    "your GPU allows")
+    cap_pct: FloatProperty(
+        name="Splats to Bake", default=100.0, min=0.1, max=100.0,
+        subtype='PERCENTAGE',
+        description="Share of THIS model's splats to bake, so the same "
+                    "setting means the same fidelity on every model (each "
+                    "splat becomes 2 triangles). Below 100%, splats are "
+                    "kept by opacity importance, so solid structure "
+                    "survives and haze goes first. Lower it if a huge "
+                    "scene makes the bake or the render heavy")
     use_texture: BoolProperty(
         name="Colour as Texture (exact)", default=True,
         description="Bake each splat's colour into one texel of a 32-bit "
@@ -1350,6 +1521,15 @@ class FGS_OT_bake(Operator):
              "with the render camera - most of the directional shading, "
              "correct from any angle. Uses more memory"),
         ])
+    match_preview: BoolProperty(
+        name="Match Preview Settings", default=True,
+        description=(
+            "Take the colour and shape settings from the panel - View Colour "
+            "Quality (SH), Gaussian Mode and AA Compensation - so the bake "
+            "reproduces what the viewport is showing instead of having its "
+            "own separate settings. When lit, it also takes Preview "
+            "Lighting, Light Gain and Preview Ambient. Untick to set the "
+            "colour mode and kernel by hand below"))
     soft: BoolProperty(
         name="Soft Round Discs", default=True,
         description="Give each disc a soft radial gaussian alpha with the "
@@ -1361,7 +1541,7 @@ class FGS_OT_bake(Operator):
         description="1.0 = faithful to the splat data. Raise if the baked "
                     "model renders thinner / more see-through than the viewport")
     lit: BoolProperty(
-        name="React to Scene Lights (Experimental)", default=False,
+        name="React to Scene Lights (Experimental)", default=True,
         description="Bake the colour as ALBEDO on a diffuse surface instead of "
                     "as emission, so the model is lit by the scene: black with "
                     "no lights, lit when a lamp shines on it, and it casts and "
@@ -1381,7 +1561,7 @@ class FGS_OT_bake(Operator):
             "0 = keep the capture's lighting, 1 = remove the full fitted "
             "trend. Only used when React to Scene Lights is on"))
     emission_mix: FloatProperty(
-        name="Keep Captured Colour", default=0.15, min=0.0, max=1.0,
+        name="Keep Captured Colour", default=0.0, min=0.0, max=1.0,
         subtype='FACTOR',
         description=(
             "Blend some of the captured colour back in as emission, so the "
@@ -1389,14 +1569,24 @@ class FGS_OT_bake(Operator):
             "albedo (fully relit, and black wherever it is unlit), 1 = the "
             "original self-lit look with no lighting response. A small amount "
             "keeps the capture readable while lamps still shape it")) 
-    cast_shadows: BoolProperty(
-        name="Cast Shadows", default=False,
+    light_gain: FloatProperty(
+        name="Light Gain", default=3.0, min=0.1, max=10.0,
         description=(
-            "Let the baked discs cast shadows. Off by default: a splat model "
-            "is a cloud of overlapping discs, so with shadows on each disc "
-            "sits in the shadow of the ones in front and the model renders "
-            "almost black with only a lit rim. Turn on only when the model "
-            "must drop a shadow onto other geometry, and expect it to darken"))
+            "How strongly the model converts incoming light into visible "
+            "brightening. The captured palette forms a constant baseline, "
+            "so at 1.0 (physically matched to a plain grey cube) a lamp "
+            "must be close before it outshines that baseline. The default "
+            "of 3 makes the model register lamps at roughly the distances "
+            "a normal object does; raise it further for a more dramatic "
+            "response"))
+    cast_shadows: BoolProperty(
+        name="Cast Shadows", default=True,
+        description=(
+            "Drop a shadow onto the rest of the scene. The shadow is carried "
+            "by a camera-invisible twin object ('<name>_shadow'), so the "
+            "visible model itself never enters a shadow map and can no "
+            "longer shadow itself dark - in EEVEE or Cycles. Off skips the "
+            "extra object"))
     normal_mode: bpy.props.EnumProperty(
         name="Splat Normals", default='CAMERA',
         items=[
@@ -1413,26 +1603,15 @@ class FGS_OT_bake(Operator):
         ],
         description="How splat normals are treated when lighting")
     shadow_strength: FloatProperty(
-        name="Shadow Strength", default=0.15, min=0.0, max=1.0,
+        name="Shadow Strength", default=1.0, min=0.0, max=1.0,
         subtype='FACTOR',
         description=(
-            "How solid the model looks to shadow rays only. Low values let "
-            "light through the cloud so the model still lights up, while it "
-            "keeps dropping a shadow onto the floor. At 1.0 every disc "
-            "shadows the ones behind it and the model goes almost black. "
-            "Camera rays are unaffected, so this never changes how the model "
-            "itself looks. Only used when Cast Shadows is on"))
-    align_discs: BoolProperty(
-        name="Align Discs to Surface", default=True,
-        description=(
-            "Re-seat each disc into a smoothed surface plane before baking, "
-            "instead of leaving it facing whichever way its own Gaussian "
-            "points. Raw splat orientations are noisy, and shading hundreds "
-            "of overlapping discs with noisy normals averages out to a flat "
-            "tint that barely reacts to lamps. Smoothing makes neighbours "
-            "share a facing so light can shade the form. Discs keep their "
-            "size, so the model looks the same unlit. This is usually the "
-            "difference between lighting working and not"))
+            "Per-DISC density of the dropped shadow, applied to the shadow "
+            "twin only. 1.0 = every disc fully solid to lamps: an honest, "
+            "dense shadow (the twin is shrunk 4%, so the model's own "
+            "lamp-facing shell stays lit either way). Lower it to let "
+            "light bleed through the cloud for a softer, hazier shadow. "
+            "Used when Cast Shadows is on"))
     def draw(self, context):
         """Explicit layout so de-lighting reads as what it is: a sub-option of
         scene lighting. Auto-generated dialogs would show it as a peer, which
@@ -1441,9 +1620,30 @@ class FGS_OT_bake(Operator):
         lay = self.layout
         lay.use_property_split = True
         lay.use_property_decorate = False
-        for name in ("cap", "min_opacity", "sh_mode", "use_texture",
-                     "soft", "boost"):
+        lay.prop(self, "match_preview")
+        for name in ("cap_pct", "min_opacity", "use_texture", "boost"):
             lay.prop(self, name)
+        # Greyed out rather than hidden when Match Preview is on: the values
+        # it is taking from the panel stay visible, so the bake never looks
+        # like it is ignoring settings that are simply being driven.
+        man = lay.column()
+        man.enabled = not self.match_preview
+        man.prop(self, "sh_mode")
+        man.prop(self, "soft")
+        if self.match_preview:
+            sc = context.scene
+            q = (sc.fgs_sh_quality
+                 if getattr(sc, "fgs_use_sh", True) else 'OFF')
+            names = {'OFF': "base colour", 'DEG1': "low SH",
+                     'DEG2': "medium SH", 'FULL': "full SH"}
+            gm = {'SOFT': "soft kernel", 'V215': "defined kernel",
+                  'PC': "web-exact kernel"}
+            bits = [names.get(q, "full SH"),
+                    gm.get(sc.fgs_pc_gaussian, "web-exact kernel")]
+            if sc.fgs_antialias:
+                bits.append("AA compensation")
+            lay.label(text="From the panel: " + ", ".join(bits),
+                      icon='CHECKMARK')
         lay.separator()
         box = lay.box()
         box.prop(self, "lit")
@@ -1460,17 +1660,12 @@ class FGS_OT_bake(Operator):
         sub.enabled = self.lit
         sub.prop(self, "delight")
         sub.prop(self, "emission_mix")
-        sub.prop(self, "align_discs")
+        sub.prop(self, "light_gain")
         sub.prop(self, "normal_mode")
         sub.prop(self, "cast_shadows")
         shad = sub.column(align=True)
         shad.enabled = self.cast_shadows
         shad.prop(self, "shadow_strength")
-        if self.lit and self.cast_shadows and self.shadow_strength > 0.5:
-            warn = sub.column(align=True)
-            warn.label(text="High Shadow Strength darkens the model:",
-                       icon='ERROR')
-            warn.label(text="each disc shadows the ones behind it.")
         if self.lit:
             from . import lighting
             hint = lighting.scene_light_hint(context)
@@ -1503,13 +1698,39 @@ class FGS_OT_bake(Operator):
                     if rv is not None:
                         cam_world = rv.view_matrix.inverted().translation
                         break
+        # -- Match Preview: the panel's settings ARE the bake's (1.20.12) ---
+        sc = context.scene
+        sh_mode = self.sh_mode
+        soft = self.soft
+        kernel = 'NORM'
+        sh_k = None
+        aa_view = None
+        emission_mix = self.emission_mix
+        light_gain = self.light_gain
+        if self.match_preview:
+            q = sc.fgs_sh_quality if getattr(sc, "fgs_use_sh", True) else 'OFF'
+            sh_k = {'OFF': 0, 'DEG1': 3, 'DEG2': 8, 'FULL': 15}.get(q, 15)
+            # 0 coefficients is the base colour, which is its own bake mode;
+            # otherwise freeze the SH toward the camera at the same degree
+            # the preview is drawing.
+            sh_mode = 'BASE' if sh_k == 0 else 'CAMERA'
+            gmode = getattr(sc, "fgs_pc_gaussian", 'PC')
+            kernel = 'PLAIN' if gmode == 'SOFT' else 'NORM'
+            soft = True                    # every preview mode is a gaussian
+            if getattr(sc, "fgs_antialias", False):
+                aa_view = _aa_camera(context, r)
+            if self.lit:
+                emission_mix = 1.0 - float(
+                    getattr(sc, "fgs_lit_preview_mix", 1.0))
+                light_gain = float(getattr(sc, "fgs_lit_preview_gain", 3.0))
         try:
             obj, n, mode, textured = _bake_cards(
-                r, context, self.cap, self.soft, self.boost, self.min_opacity,
-                self.sh_mode, cam_world, self.use_texture, self.lit,
-                self.delight, self.emission_mix, self.cast_shadows,
+                r, context, self.cap_pct, soft, self.boost,
+                self.min_opacity,
+                sh_mode, cam_world, self.use_texture, self.lit,
+                self.delight, emission_mix, self.cast_shadows,
                 self.normal_mode, self.shadow_strength,
-                self.align_discs)
+                light_gain, sh_k, kernel, aa_view)
         except Exception as e:
             import traceback
             traceback.print_exc()          # full cause in the system console
@@ -1530,13 +1751,33 @@ class FGS_OT_bake(Operator):
                  'LIVE1': "live degree-1 SH"}[mode]
         src = "texture" if textured else "vertex colour"
         note = "" if mode == self.sh_mode else " - no SH, used base"
-        shade = "scene-lit" if self.lit else "self-lit"
+        shade = ("scene-lit + shadow proxy"
+                 if (self.lit and self.cast_shadows)
+                 else "scene-lit" if self.lit else "self-lit")
         if self.lit:
             from . import lighting
+            params = (f"splats={self.cap_pct:g}%, "
+                      f"match_preview={self.match_preview}, "
+                      f"sh={sh_mode}/{sh_k}, kernel={kernel}, "
+                      f"aa={aa_view is not None}, "
+                      f"emission_mix={emission_mix:g}, "
+                      f"delight={self.delight:g}, "
+                      f"normals={self.normal_mode}, "
+                      f"cast={self.cast_shadows}, "
+                      f"strength={self.shadow_strength:g}, "
+                      f"gain={light_gain:g}, "
+                      f"soft={self.soft}, boost={self.boost:g}")
+            env, warns = lighting.describe_lit_environment(context, params)
+            print("[SplatBake] lit environment: " + env)
+            if emission_mix >= 0.5:
+                warns.append(f"Keep Captured Colour={emission_mix:.2f}:"
+                             " mostly self-lit, lamps will barely register")
             hint = lighting.scene_light_hint(context)
             if hint:
+                warns.insert(0, hint)
+            if warns:
                 self.report({'WARNING'}, f"Baked '{obj.name}' ({n:,} discs, "
-                                         f"scene-lit) - {hint}")
+                                         f"{shade}) - " + "; ".join(warns))
                 return {'FINISHED'}
         self.report({'INFO'},
                     f"Baked '{obj.name}' ({n:,} discs, {shade}, {label} via "
@@ -1544,379 +1785,543 @@ class FGS_OT_bake(Operator):
         return {'FINISHED'}
 
 
-def _surface_material(name, emissive):
-    """Material for the baked surface: vertex colours into a lit Principled
-    BSDF (default) or an unlit Emission shader."""
-    mat = bpy.data.materials.new(name + "_mat")
-    mat.use_nodes = True
-    nt = mat.node_tree
-    for nd in list(nt.nodes):
-        nt.nodes.remove(nd)
-    col = nt.nodes.new('ShaderNodeAttribute'); col.attribute_name = "Col"
-    col.location = (-500, 0)
-    out = nt.nodes.new('ShaderNodeOutputMaterial'); out.location = (240, 0)
-    if emissive:
-        sh = nt.nodes.new('ShaderNodeEmission'); sh.location = (-150, 0)
-        nt.links.new(col.outputs["Color"], sh.inputs["Color"])
-        nt.links.new(sh.outputs["Emission"], out.inputs["Surface"])
-    else:
-        sh = nt.nodes.new('ShaderNodeBsdfPrincipled'); sh.location = (-150, 0)
-        nt.links.new(col.outputs["Color"], sh.inputs["Base Color"])
-        try:
-            sh.inputs["Roughness"].default_value = 0.85
-        except Exception:
-            pass
-        nt.links.new(sh.outputs["BSDF"], out.inputs["Surface"])
-    return mat
-
-
-def _surface_radii(scale, voxel, radius_scale=1.0, despike=4.0):
-    """Per-splat blob radius for the volume reconstruction, in world units.
-
-    The old code used ONE radius for every splat, derived from the grid
-    resolution (1.6 * voxel). Two things went wrong with that:
-
-      * a tiny detail splat and a huge wall splat inflated to the same blob,
-        so thin structures fattened and broad surfaces went lumpy - the
-        surface could not follow the real contour because it no longer knew
-        what the real contour was;
-      * the radius was tied to Detail, so raising Detail SHRANK every blob
-        and the surface broke up. Detail should change resolution, not shape.
-
-    Now each splat contributes a blob sized by its own gaussian: the mean of
-    its two largest axes (the disc the splat actually draws - the smallest
-    axis is its thickness, which would under-size it), de-spiked so needle
-    splats can't balloon, and floored at ~1.1 voxels so every blob is big
-    enough to register on the grid and connect to its neighbours.
-    """
-    s = np.sort(np.maximum(scale.astype(np.float32), 1e-9), axis=1)
-    if despike > 0.0:
-        med = np.median(s, axis=1)
-        s = np.minimum(s, (float(despike) * med)[:, None])
-    rad = 0.5 * (s[:, 2] + s[:, 1]) * float(radius_scale)
-    lo = 1.1 * float(voxel)                  # must span a voxel to register
-    hi = 24.0 * float(voxel)                 # stop one fat splat blobbing all
-    return np.clip(rad, lo, hi).astype(np.float32)
-
-
-def _auto_detail(span, radii, target=2.0, lo=32, hi=8000):
-    """Grid resolution that actually resolves the splats.
-
-    "Detail" divides the scene's longest axis, so the right value depends
-    entirely on how big the splats are relative to the scene - a fixed number
-    is meaningless. Measured on a real 1.9M-splat scan: the scene spans 363
-    units but a typical splat radius is 0.044, so even detail=400 gives a
-    voxel 21x larger than a splat. At that size every blob collapses to a
-    single voxel and the surface CANNOT follow the contour, however the
-    radius is computed. That was the real accuracy ceiling.
-
-    Target ~2 voxels per splat radius. OpenVDB is sparse, so the cost tracks
-    occupied voxels (points x blob volume), not the full grid - which is why
-    four-figure detail is affordable.
-    """
-    med = float(np.median(radii))
-    if med <= 0.0:
-        return int(np.clip(200, lo, hi))
-    return int(np.clip(round(span / (target * med)), lo, hi))
-
-
-def _bake_surface(r, context, detail, min_opacity, cap, emissive, smooth,
-                  radius_scale=1.0, threshold=0.12, auto_detail=False):
-    """Reconstruct ONE solid mesh from the splat cloud: a density volume is
-    built on a detail^3-style grid (OpenVDB Points->Volume) and its isosurface
-    extracted (Volume->Mesh). Vertex colours come from the nearest splat."""
-    sc = context.scene
-    src = r.source
-    idx = np.where(r.alive)[0]
-    op_full = src.get("opacity")
-    if op_full is not None:
-        keep = op_full[idx].astype(np.float32) >= float(min_opacity)
-        idx = idx[keep]
-    if len(idx) < 16:
-        raise RuntimeError("too few solid splats - lower Min Opacity")
-    if len(idx) > cap:
-        # Opacity-weighted, like the disc bake: a uniform draw discards solid
-        # surface splats at the same rate as haze, which pits the
-        # reconstruction. Efraimidis-Spirakis keys give weighted sampling
-        # without replacement in one pass.
-        rng = np.random.default_rng(0)
-        u = rng.random(len(idx))
-        if op_full is not None:
-            w = np.clip(op_full[idx].astype(np.float64), 1e-4, None)
-            keys = np.log(np.maximum(u, 1e-12)) / w
-        else:
-            keys = u
-        idx = np.sort(idx[np.argpartition(keys, -int(cap))[-int(cap):]])
-
-    M = np.array(r.model_matrix(), dtype=np.float32)
-    pts = src["xyz"][idx].astype(np.float32) @ M[:3, :3].T + M[:3, 3]
-
-    span = float((pts.max(axis=0) - pts.min(axis=0)).max())
-    if span <= 0.0:
-        raise RuntimeError("degenerate point cloud")
-
-    # Uniform world scale of the model, so a scaled-up model gets bigger blobs.
-    msc = float(np.cbrt(abs(np.linalg.det(M[:3, :3]))))
-    if not np.isfinite(msc) or msc <= 0.0:
-        msc = 1.0
-    wscale = src["scale"][idx] * msc
-    aniso = float(sc.fgs_despike) or 4.0
-
-    if auto_detail:
-        # Size the grid from the splats themselves (voxel=0 here: the floor
-        # clamp is what we are trying to choose, so ask for the raw sizes).
-        detail = _auto_detail(span, _surface_radii(wscale, 0.0, radius_scale,
-                                                   aniso))
-    voxel = span / float(detail)          # "levels" along the largest axis
-    radii = _surface_radii(wscale, voxel, radius_scale, aniso)
-    ratio = voxel / max(float(np.median(_surface_radii(wscale, 0.0,
-                                                       radius_scale, aniso))),
-                        1e-9)
-
-    nm_src = bpy.data.objects.get(r.box_name)
-    nm = (nm_src.name if nm_src else "Splat") + "_surface"
-
-    mesh = bpy.data.meshes.new(nm)
-    mesh.vertices.add(len(pts))
-    mesh.vertices.foreach_set("co", np.ascontiguousarray(pts, np.float32).ravel())
-    # The per-point radius travels into geometry nodes as a named attribute.
-    have_radii = False
-    try:
-        mesh.attributes.new("splat_radius", 'FLOAT', 'POINT').data.foreach_set(
-            "value", radii)
-        have_radii = True
-    except Exception as e:
-        print("[SplatBake] per-splat radius attribute failed:", e)
-    mesh.update()
-    obj = bpy.data.objects.new(nm, mesh)
-    context.collection.objects.link(obj)
-
-    ng = None
-    try:
-        ng = bpy.data.node_groups.new(nm + "_gn", 'GeometryNodeTree')
-        ng.interface.new_socket("Geometry", in_out='INPUT',
-                                socket_type='NodeSocketGeometry')
-        ng.interface.new_socket("Geometry", in_out='OUTPUT',
-                                socket_type='NodeSocketGeometry')
-        n_in = ng.nodes.new('NodeGroupInput')
-        n_out = ng.nodes.new('NodeGroupOutput')
-        m2p = ng.nodes.new('GeometryNodeMeshToPoints')
-        try:
-            m2p.mode = 'VERTICES'
-        except Exception:
-            pass
-        p2v = ng.nodes.new('GeometryNodePointsToVolume')
-        try:
-            p2v.resolution_mode = 'VOXEL_SIZE'
-        except Exception:
-            pass
-        p2v.inputs["Voxel Size"].default_value = voxel
-        # Fallback constant if the attribute route is unavailable.
-        p2v.inputs["Radius"].default_value = float(np.median(radii))
-        if have_radii:
-            try:
-                nattr = ng.nodes.new('GeometryNodeInputNamedAttribute')
-                nattr.data_type = 'FLOAT'
-                nattr.inputs["Name"].default_value = "splat_radius"
-                ng.links.new(nattr.outputs["Attribute"],
-                             p2v.inputs["Radius"])
-            except Exception as e:
-                print("[SplatBake] per-splat radius link failed, "
-                      "using a single radius:", e)
-        try:
-            p2v.inputs["Density"].default_value = 1.0
-        except Exception:
-            pass
-        v2m = ng.nodes.new('GeometryNodeVolumeToMesh')
-        try:
-            v2m.resolution_mode = 'GRID'
-        except Exception:
-            pass
-        try:
-            # Threshold is the isosurface level: low = the surface sits far
-            # out in each splat's falloff (puffy, closes holes), high = it
-            # hugs the dense core (tight, but can open gaps).
-            v2m.inputs["Threshold"].default_value = float(threshold)
-            v2m.inputs["Adaptivity"].default_value = 0.0
-        except Exception:
-            pass
-        ng.links.new(n_in.outputs[0], m2p.inputs["Mesh"])
-        ng.links.new(m2p.outputs["Points"], p2v.inputs["Points"])
-        ng.links.new(p2v.outputs["Volume"], v2m.inputs["Volume"])
-        ng.links.new(v2m.outputs["Mesh"], n_out.inputs[0])
-
-        mod = obj.modifiers.new("SplatSurface", 'NODES')
-        mod.node_group = ng
-
-        context.view_layer.update()
-        deps = context.evaluated_depsgraph_get()
-        new_mesh = bpy.data.meshes.new_from_object(obj.evaluated_get(deps))
-        if len(new_mesh.vertices) == 0:
-            bpy.data.meshes.remove(new_mesh)
-            raise RuntimeError(
-                "surface came out empty - raise Detail, lower Min Opacity, "
-                "or this Blender build lacks OpenVDB volume nodes")
-        obj.modifiers.clear()
-        old = obj.data
-        obj.data = new_mesh
-        bpy.data.meshes.remove(old)
-    finally:
-        if ng is not None:
-            try:
-                bpy.data.node_groups.remove(ng)
-            except Exception:
-                pass
-
-    # colour each surface vertex from its nearest splats (KD-tree, C-speed);
-    # averaging the 3 nearest smooths single-splat speckle off the surface
-    from mathutils import kdtree
-    kd = kdtree.KDTree(len(pts))
-    for i, pnt in enumerate(pts):
-        kd.insert(pnt.tolist(), i)
-    kd.balance()
-    graded = _grade_np(src["rgb"][idx], sc)
-    vcount = len(new_mesh.vertices)
-    cols = np.ones((vcount, 4), np.float32)
-    for vi, v in enumerate(new_mesh.vertices):
-        hits = kd.find_n(v.co, 3)
-        if hits:
-            cols[vi, :3] = np.mean([graded[h[1]] for h in hits], axis=0)
-    new_mesh.color_attributes.new("Col", 'FLOAT_COLOR', 'POINT').data.foreach_set(
-        "color", cols.ravel())
-
-    if smooth:
-        new_mesh.polygons.foreach_set(
-            "use_smooth", np.ones(len(new_mesh.polygons), dtype=bool))
-        new_mesh.update()
-
-    new_mesh.materials.append(_surface_material(nm, emissive))
-
-    for so in context.selected_objects:
-        so.select_set(False)
-    obj.select_set(True)
-    context.view_layer.objects.active = obj
-    info = f"detail {int(detail)}, voxel {voxel:.4g} ({ratio:.1f}x a splat)"
-    if ratio > 4.0:
-        info += " - raise Detail to follow the contour more closely"
-    return obj, vcount, len(new_mesh.polygons), info
-
-
-class FGS_OT_bake_surface(Operator):
-    bl_idname = "fgs.bake_surface"
-    bl_label = "Bake Surface Mesh (solid)"
-    bl_options = {'REGISTER', 'UNDO'}
-    bl_description = ("Reconstruct ONE solid mesh from the active model's point "
-                     "cloud: each splat contributes a blob sized by its own "
-                     "gaussian, the density is sampled on a voxel grid and the "
-                     "isosurface extracted, then UV-unwrapped and textured. "
-                     "Lit like a normal object; good for sculpt/retopo, F12 "
-                     "renders, and OBJ/glTF/STL export")
-    auto_detail: BoolProperty(
-        name="Match Splat Size (auto detail)", default=True,
-        description="Choose the grid resolution from the splats themselves, "
-                    "aiming for about two voxels per splat. The right value "
-                    "depends on how big the splats are relative to the scene, "
-                    "so a fixed number rarely follows the contour. Untick to "
-                    "set Detail by hand")
-    detail: IntProperty(
-        name="Detail (levels per axis)", default=100, min=10, max=8000,
-        description="Grid resolution along the model's largest axis, used "
-                    "when auto detail is off. If this is much coarser than "
-                    "the splats, every blob collapses to one voxel and the "
-                    "surface cannot follow the contour - the status bar "
-                    "reports the voxel size against the splat size")
-    min_opacity: FloatProperty(
-        name="Min Opacity", default=0.3, min=0.0, max=1.0,
-        description="Ignore splats fainter than this, so haze and floaters "
-                    "don't inflate the surface")
-    cap: IntProperty(
-        name="Max Points", default=300000, min=1000, max=1000000,
-        description="Upper limit of splat centres fed into the reconstruction. "
-                    "Splats over the limit are kept by opacity importance, so "
-                    "solid structure survives and haze goes first")
-    radius_scale: FloatProperty(
-        name="Blob Size", default=1.0, min=0.25, max=4.0,
-        description="Multiplies each splat's own radius. 1.0 follows the "
-                    "gaussian sizes as captured. Raise it to close holes in "
-                    "a sparse scan, lower it for a tighter, leaner surface "
-                    "that follows fine detail more closely")
-    threshold: FloatProperty(
-        name="Surface Tightness", default=0.12, min=0.01, max=0.9,
-        description="Isosurface level. LOW sits far out in each splat's "
-                    "falloff - puffier, but closes gaps. HIGH hugs the dense "
-                    "core - tighter to the real contour, but can open holes "
-                    "in thin or sparse areas")
-    emissive: BoolProperty(
-        name="Emissive (unlit)", default=False,
-        description="Use an unlit emission material instead of a lit "
-                    "Principled surface")
-    smooth: BoolProperty(
-        name="Shade Smooth", default=True,
-        description="Smooth-shade the reconstructed surface")
-    do_uv: BoolProperty(
-        name="Generate UV Map", default=True,
-        description="Unwrap the reconstructed surface (Smart UV Project) so "
-                    "it can carry a texture, be painted on, or be exported "
-                    "with its colours intact")
-    do_texture: BoolProperty(
-        name="Bake Colours to Texture", default=True,
-        description="Rasterise the splat colours into an image through the "
-                    "new UV layout and use it as the surface texture. Colour "
-                    "detail is then set by the texture, not by how dense the "
-                    "mesh is - and unlike vertex colours it survives export "
-                    "to glTF / FBX / OBJ")
-    tex_size: bpy.props.EnumProperty(
-        name="Texture Size", default='2048',
-        description="Resolution of the baked texture",
-        items=[('1024', "1024 x 1024", "Fast, for small or distant models"),
-               ('2048', "2048 x 2048", "Good default"),
-               ('4096', "4096 x 4096", "Sharp; slower to bake and heavier")])
-
-    def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self)
-
-    def execute(self, context):
-        r = state.active_renderer(context)
-        if r is None:
-            self.report({'WARNING'}, "No active model - load or select one first")
-            return {'CANCELLED'}
-        try:
-            obj, nv, nf, info = _bake_surface(
-                r, context, self.detail, self.min_opacity, self.cap,
-                self.emissive, self.smooth, self.radius_scale,
-                self.threshold, self.auto_detail)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self.report({'ERROR'}, f"Surface bake failed: {e}")
-            return {'CANCELLED'}
-
-        # UV + texture live in uvtools.py; a failure there must not throw away
-        # the surface that was just reconstructed, so it degrades to the
-        # vertex-coloured mesh instead of cancelling.
-        extra = ""
-        if self.do_uv:
-            try:
-                from . import uvtools
-                how = uvtools.smart_unwrap(obj)
-                extra = f", UV ({how})"
-                if self.do_texture:
-                    img, cov = uvtools.bake_texture(obj, int(self.tex_size))
-                    uvtools.apply_texture(obj, img, self.emissive)
-                    extra += f" + {self.tex_size}px texture ({cov * 100:.0f}% used)"
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                self.report({'WARNING'},
-                            f"Surface built, but UV/texture step failed: {e}")
-                return {'FINISHED'}
-        self.report({'INFO'},
-                    f"Built '{obj.name}': {nv:,} verts / {nf:,} faces - "
-                    f"{info}{extra}")
-        return {'FINISHED'}
-
-
-
+# ---------------------------------------------------------------------------
+# EXPERIMENTAL - Bake Solid Surface, PARKED in 1.20.4.
+# The volume reconstruction did not meet the bar on real captures, so the
+# whole path is commented out rather than shipped half-working: the helpers
+# (_surface_material, _surface_radii, _auto_detail, _snap_to_splats,
+# _bake_surface) and the FGS_OT_bake_surface operator. uvtools.py (UV +
+# texture) has no other caller and sits idle with it. NOTHING below is
+# shared with the disc bake, which keeps its own live helpers above
+# (_bake_cards, _bake_material, _disc_geometry, _grade_np,
+# lighting.surface_normals). To resume: un-comment this block, the two
+# names in `classes`, and the button rows in ui.py.
+# ---------------------------------------------------------------------------
+# def _surface_material(name, emissive):
+#     """Material for the baked surface: vertex colours into a lit Principled
+#     BSDF (default) or an unlit Emission shader."""
+#     mat = bpy.data.materials.new(name + "_mat")
+#     mat.use_nodes = True
+#     nt = mat.node_tree
+#     for nd in list(nt.nodes):
+#         nt.nodes.remove(nd)
+#     col = nt.nodes.new('ShaderNodeAttribute'); col.attribute_name = "Col"
+#     col.location = (-500, 0)
+#     out = nt.nodes.new('ShaderNodeOutputMaterial'); out.location = (240, 0)
+#     if emissive:
+#         sh = nt.nodes.new('ShaderNodeEmission'); sh.location = (-150, 0)
+#         nt.links.new(col.outputs["Color"], sh.inputs["Color"])
+#         nt.links.new(sh.outputs["Emission"], out.inputs["Surface"])
+#     else:
+#         sh = nt.nodes.new('ShaderNodeBsdfPrincipled'); sh.location = (-150, 0)
+#         nt.links.new(col.outputs["Color"], sh.inputs["Base Color"])
+#         try:
+#             sh.inputs["Roughness"].default_value = 0.85
+#         except Exception:
+#             pass
+#         nt.links.new(sh.outputs["BSDF"], out.inputs["Surface"])
+#     return mat
+#
+#
+# def _surface_radii(scale, voxel, radius_scale=1.0, despike=4.0):
+#     """Per-splat blob radius for the volume reconstruction, in world units.
+#
+#     The old code used ONE radius for every splat, derived from the grid
+#     resolution (1.6 * voxel). Two things went wrong with that:
+#
+#       * a tiny detail splat and a huge wall splat inflated to the same blob,
+#         so thin structures fattened and broad surfaces went lumpy - the
+#         surface could not follow the real contour because it no longer knew
+#         what the real contour was;
+#       * the radius was tied to Detail, so raising Detail SHRANK every blob
+#         and the surface broke up. Detail should change resolution, not shape.
+#
+#     Now each splat contributes a blob sized by its own gaussian: the mean of
+#     its two largest axes (the disc the splat actually draws - the smallest
+#     axis is its thickness, which would under-size it), de-spiked so needle
+#     splats can't balloon, and floored at ~1.1 voxels so every blob is big
+#     enough to register on the grid and connect to its neighbours.
+#
+#     voxel=0 means "no grid yet - give me the raw sizes" (auto detail and the
+#     ratio report ask for them). That call used to fall through to
+#     np.clip(rad, 0, 0), which zeroed every radius: _auto_detail then saw a
+#     zero median and quietly fell back to detail=200 whatever the scene, and
+#     the voxel:splat ratio divided by (near) zero. One clip made
+#     "Match Splat Size" a constant. (fixed in 1.20.2)
+#     """
+#     s = np.sort(np.maximum(scale.astype(np.float32), 1e-9), axis=1)
+#     if despike > 0.0:
+#         med = np.median(s, axis=1)
+#         s = np.minimum(s, (float(despike) * med)[:, None])
+#     rad = 0.5 * (s[:, 2] + s[:, 1]) * float(radius_scale)
+#     if voxel > 0.0:
+#         lo = 1.1 * float(voxel)              # must span a voxel to register
+#         hi = 24.0 * float(voxel)             # stop one fat splat blobbing all
+#         rad = np.clip(rad, lo, hi)
+#     return rad.astype(np.float32)
+#
+#
+# def _auto_detail(span, radii, target=2.0, lo=32, hi=8000):
+#     """Grid resolution that actually resolves the splats.
+#
+#     "Detail" divides the scene's longest axis, so the right value depends
+#     entirely on how big the splats are relative to the scene - a fixed number
+#     is meaningless. Measured on a real 1.9M-splat scan: the scene spans 363
+#     units but a typical splat radius is 0.044, so even detail=400 gives a
+#     voxel 21x larger than a splat. At that size every blob collapses to a
+#     single voxel and the surface CANNOT follow the contour, however the
+#     radius is computed. That was the real accuracy ceiling.
+#
+#     Target ~2 voxels per splat radius. OpenVDB is sparse, so the cost tracks
+#     occupied voxels (points x blob volume), not the full grid - which is why
+#     four-figure detail is affordable.
+#
+#     (1.20.2: the original formula divided span by target*radius, so the
+#     voxel came out target TIMES the radius - 4x coarser than documented -
+#     and the 1.1-voxel floor then re-inflated most splats to match. Multiply,
+#     don't divide. The hi clamp now binds on large scenes; the reported
+#     voxel:splat ratio shows by how much.)
+#     """
+#     med = float(np.median(radii))
+#     if med <= 0.0:
+#         return int(np.clip(200, lo, hi))
+#     return int(np.clip(round(float(target) * span / med), lo, hi))
+#
+#
+# def _snap_to_splats(v, kd, pts, nrm, sig, op, k=12, iters=3):
+#     """Pull each isosurface vertex onto the plane of its nearby splats.
+#
+#     WHY
+#     ---
+#     Points->Volume sums UNSIGNED blobs, so the extracted level set can only
+#     sit somewhere out in the summed falloff. Where exactly depends on the
+#     threshold AND on how many splats overlap locally: dense areas bulge
+#     outward, sparse rims pull tight. No threshold is right everywhere, so
+#     the shell floats off the splats by a varying amount.
+#
+#     THE FIX
+#     -------
+#     Implicit moving least squares: for the k nearest splats, take the
+#     opacity- and distance-weighted mean of each splat's signed plane
+#     distance n.(v - p), and walk the vertex back by it along the mean
+#     normal. The zero set of that weighted mean passes through the splats
+#     by construction - it is their weighted median plane - so three capped
+#     steps land every vertex on the surface the splats describe, while the
+#     volume mesh keeps supplying topology and closed holes.
+#
+#     GUARDS - the pass may only tighten, never destroy:
+#       * no splat support (the volume bridged a real gap): vertex stays put;
+#       * neighbours whose normal opposes the local mean are dropped, so a
+#         thin wall's far side never averages against its near side
+#         (verified on a synthetic two-sided wall: snaps to the near face,
+#         not the midpoint);
+#       * each step is capped at the local median splat radius, so one bad
+#         normal cannot fling a vertex.
+#
+#     Returns (moved_count, mean_shift, max_shift) in world units - an
+#     alignment claim should ship with its measurement.
+#     """
+#     n_moved, tot, mx = 0, 0.0, 0.0
+#     kk = int(min(max(k, 1), len(pts)))
+#     for vi in range(len(v)):
+#         x0, y0, z0 = float(v[vi, 0]), float(v[vi, 1]), float(v[vi, 2])
+#         loc = (x0, y0, z0)
+#         for _ in range(int(iters)):
+#             hits = kd.find_n(loc, kk)
+#             if not hits:
+#                 break
+#             ids = np.fromiter((h[1] for h in hits), np.intp, len(hits))
+#             d = np.fromiter((h[2] for h in hits), np.float32, len(hits))
+#             s = sig[ids]
+#             w = op[ids] * np.exp(-0.5 * np.square(d / s))
+#             w[d > 3.0 * s] = 0.0
+#             if float(w.sum()) < 1e-6:            # bridged gap - leave it be
+#                 break
+#             n = nrm[ids]
+#             mean_n = (w[:, None] * n).sum(axis=0)
+#             ln = float(np.linalg.norm(mean_n))
+#             if ln < 1e-8:
+#                 break
+#             mean_n /= ln
+#             keep = (n @ mean_n) > 0.0            # drop the wall's far side
+#             w *= keep
+#             ws = float(w.sum())
+#             if ws < 1e-6:
+#                 break
+#             q = np.array(loc, np.float32) - pts[ids]
+#             f = float((w * np.einsum('ij,ij->i', n, q)).sum() / ws)
+#             cap_step = float(np.median(s[keep]))
+#             if f > cap_step:
+#                 f = cap_step
+#             elif f < -cap_step:
+#                 f = -cap_step
+#             loc = (loc[0] - f * float(mean_n[0]),
+#                    loc[1] - f * float(mean_n[1]),
+#                    loc[2] - f * float(mean_n[2]))
+#         dd = ((loc[0] - x0) ** 2 + (loc[1] - y0) ** 2
+#               + (loc[2] - z0) ** 2) ** 0.5
+#         if dd > 0.0:
+#             v[vi, 0], v[vi, 1], v[vi, 2] = loc
+#             n_moved += 1
+#             tot += dd
+#             mx = max(mx, dd)
+#     return n_moved, (tot / n_moved if n_moved else 0.0), mx
+#
+#
+# def _bake_surface(r, context, detail, min_opacity, cap, emissive, smooth,
+#                   radius_scale=1.0, threshold=0.12, auto_detail=False,
+#                   snap=True):
+#     """Reconstruct ONE solid mesh from the splat cloud: a density volume is
+#     built on a detail^3-style grid (OpenVDB Points->Volume) and its isosurface
+#     extracted (Volume->Mesh). Vertex colours come from the nearest splat."""
+#     sc = context.scene
+#     src = r.source
+#     idx = np.where(r.alive)[0]
+#     op_full = src.get("opacity")
+#     if op_full is not None:
+#         keep = op_full[idx].astype(np.float32) >= float(min_opacity)
+#         idx = idx[keep]
+#     if len(idx) < 16:
+#         raise RuntimeError("too few solid splats - lower Min Opacity")
+#     if len(idx) > cap:
+#         # Opacity-weighted, like the disc bake: a uniform draw discards solid
+#         # surface splats at the same rate as haze, which pits the
+#         # reconstruction. Efraimidis-Spirakis keys give weighted sampling
+#         # without replacement in one pass.
+#         rng = np.random.default_rng(0)
+#         u = rng.random(len(idx))
+#         if op_full is not None:
+#             w = np.clip(op_full[idx].astype(np.float64), 1e-4, None)
+#             keys = np.log(np.maximum(u, 1e-12)) / w
+#         else:
+#             keys = u
+#         idx = np.sort(idx[np.argpartition(keys, -int(cap))[-int(cap):]])
+#
+#     M = np.array(r.model_matrix(), dtype=np.float32)
+#     pts = src["xyz"][idx].astype(np.float32) @ M[:3, :3].T + M[:3, 3]
+#
+#     span = float((pts.max(axis=0) - pts.min(axis=0)).max())
+#     if span <= 0.0:
+#         raise RuntimeError("degenerate point cloud")
+#
+#     # Uniform world scale of the model, so a scaled-up model gets bigger blobs.
+#     msc = float(np.cbrt(abs(np.linalg.det(M[:3, :3]))))
+#     if not np.isfinite(msc) or msc <= 0.0:
+#         msc = 1.0
+#     wscale = src["scale"][idx] * msc
+#     aniso = float(sc.fgs_despike) or 4.0
+#
+#     if auto_detail:
+#         # Size the grid from the splats themselves (voxel=0 here: the floor
+#         # clamp is what we are trying to choose, so ask for the raw sizes).
+#         detail = _auto_detail(span, _surface_radii(wscale, 0.0, radius_scale,
+#                                                    aniso))
+#     voxel = span / float(detail)          # "levels" along the largest axis
+#     radii = _surface_radii(wscale, voxel, radius_scale, aniso)
+#     ratio = voxel / max(float(np.median(_surface_radii(wscale, 0.0,
+#                                                        radius_scale, aniso))),
+#                         1e-9)
+#
+#     nm_src = bpy.data.objects.get(r.box_name)
+#     nm = (nm_src.name if nm_src else "Splat") + "_surface"
+#
+#     mesh = bpy.data.meshes.new(nm)
+#     mesh.vertices.add(len(pts))
+#     mesh.vertices.foreach_set("co", np.ascontiguousarray(pts, np.float32).ravel())
+#     # The per-point radius travels into geometry nodes as a named attribute.
+#     have_radii = False
+#     try:
+#         mesh.attributes.new("splat_radius", 'FLOAT', 'POINT').data.foreach_set(
+#             "value", radii)
+#         have_radii = True
+#     except Exception as e:
+#         print("[SplatBake] per-splat radius attribute failed:", e)
+#     mesh.update()
+#     obj = bpy.data.objects.new(nm, mesh)
+#     context.collection.objects.link(obj)
+#
+#     ng = None
+#     try:
+#         ng = bpy.data.node_groups.new(nm + "_gn", 'GeometryNodeTree')
+#         ng.interface.new_socket("Geometry", in_out='INPUT',
+#                                 socket_type='NodeSocketGeometry')
+#         ng.interface.new_socket("Geometry", in_out='OUTPUT',
+#                                 socket_type='NodeSocketGeometry')
+#         n_in = ng.nodes.new('NodeGroupInput')
+#         n_out = ng.nodes.new('NodeGroupOutput')
+#         m2p = ng.nodes.new('GeometryNodeMeshToPoints')
+#         try:
+#             m2p.mode = 'VERTICES'
+#         except Exception:
+#             pass
+#         p2v = ng.nodes.new('GeometryNodePointsToVolume')
+#         try:
+#             p2v.resolution_mode = 'VOXEL_SIZE'
+#         except Exception:
+#             pass
+#         p2v.inputs["Voxel Size"].default_value = voxel
+#         # Fallback constant if the attribute route is unavailable.
+#         p2v.inputs["Radius"].default_value = float(np.median(radii))
+#         if have_radii:
+#             try:
+#                 nattr = ng.nodes.new('GeometryNodeInputNamedAttribute')
+#                 nattr.data_type = 'FLOAT'
+#                 nattr.inputs["Name"].default_value = "splat_radius"
+#                 ng.links.new(nattr.outputs["Attribute"],
+#                              p2v.inputs["Radius"])
+#             except Exception as e:
+#                 print("[SplatBake] per-splat radius link failed, "
+#                       "using a single radius:", e)
+#         try:
+#             p2v.inputs["Density"].default_value = 1.0
+#         except Exception:
+#             pass
+#         v2m = ng.nodes.new('GeometryNodeVolumeToMesh')
+#         try:
+#             v2m.resolution_mode = 'GRID'
+#         except Exception:
+#             pass
+#         try:
+#             # Threshold is the isosurface level: low = the surface sits far
+#             # out in each splat's falloff (puffy, closes holes), high = it
+#             # hugs the dense core (tight, but can open gaps).
+#             v2m.inputs["Threshold"].default_value = float(threshold)
+#             v2m.inputs["Adaptivity"].default_value = 0.0
+#         except Exception:
+#             pass
+#         ng.links.new(n_in.outputs[0], m2p.inputs["Mesh"])
+#         ng.links.new(m2p.outputs["Points"], p2v.inputs["Points"])
+#         ng.links.new(p2v.outputs["Volume"], v2m.inputs["Volume"])
+#         ng.links.new(v2m.outputs["Mesh"], n_out.inputs[0])
+#
+#         mod = obj.modifiers.new("SplatSurface", 'NODES')
+#         mod.node_group = ng
+#
+#         context.view_layer.update()
+#         deps = context.evaluated_depsgraph_get()
+#         new_mesh = bpy.data.meshes.new_from_object(obj.evaluated_get(deps))
+#         if len(new_mesh.vertices) == 0:
+#             bpy.data.meshes.remove(new_mesh)
+#             raise RuntimeError(
+#                 "surface came out empty - raise Detail, lower Min Opacity, "
+#                 "or this Blender build lacks OpenVDB volume nodes")
+#         obj.modifiers.clear()
+#         old = obj.data
+#         obj.data = new_mesh
+#         bpy.data.meshes.remove(old)
+#     finally:
+#         if ng is not None:
+#             try:
+#                 bpy.data.node_groups.remove(ng)
+#             except Exception:
+#                 pass
+#
+#     # colour each surface vertex from its nearest splats (KD-tree, C-speed);
+#     # averaging the 3 nearest smooths single-splat speckle off the surface
+#     from mathutils import kdtree
+#     kd = kdtree.KDTree(len(pts))
+#     for i, pnt in enumerate(pts):
+#         kd.insert(pnt.tolist(), i)
+#     kd.balance()
+#
+#     # -- snap the shell onto the splats, BEFORE colours are sampled --------
+#     snap_note = ""
+#     if snap:
+#         import time as _time
+#         _ts = _time.perf_counter()
+#         try:
+#             from . import lighting as _ln
+#             s_nrm = _ln.surface_normals(
+#                 src["xyz"][idx].astype(np.float32),
+#                 src["quat"][idx].astype(np.float32),
+#                 src["scale"][idx].astype(np.float32))
+#             try:
+#                 # Normals transform by the inverse-transpose; these are row
+#                 # vectors, so multiply by the plain inverse.
+#                 s_nrm = s_nrm @ np.linalg.inv(M[:3, :3])
+#             except np.linalg.LinAlgError:
+#                 print("[SplatBake] singular model matrix - snapping with "
+#                       "model-space normals")
+#             s_nrm /= np.maximum(
+#                 np.linalg.norm(s_nrm, axis=1, keepdims=True), 1e-8)
+#             # Raw per-splat disc radii (voxel=0: no grid clamp) as the
+#             # weight bandwidth - a pancake pulls from its own footprint.
+#             sig = np.maximum(
+#                 _surface_radii(wscale, 0.0, radius_scale, aniso), 1e-6)
+#             op_w = (np.clip(op_full[idx].astype(np.float32), 0.05, 1.0)
+#                     if op_full is not None
+#                     else np.ones(len(idx), np.float32))
+#             vco = np.empty(len(new_mesh.vertices) * 3, np.float32)
+#             new_mesh.vertices.foreach_get("co", vco)
+#             vco = vco.reshape(-1, 3)
+#             n_mv, avg_d, max_d = _snap_to_splats(vco, kd, pts, s_nrm,
+#                                                  sig, op_w)
+#             new_mesh.vertices.foreach_set("co", vco.ravel())
+#             new_mesh.update()
+#             snap_note = (f", snapped {n_mv:,}/{len(vco):,} verts "
+#                          f"(avg {avg_d:.4g}, max {max_d:.4g})")
+#             print(f"[SplatBake] snap-to-splats:{snap_note[1:]} in "
+#                   f"{_time.perf_counter() - _ts:.1f}s")
+#         except Exception as e:
+#             import traceback
+#             traceback.print_exc()
+#             print("[SplatBake] snap-to-splats failed, mesh left as "
+#                   "extracted:", e)
+#             snap_note = ", snap FAILED (see console)"
+#
+#     graded = _grade_np(src["rgb"][idx], sc)
+#     vcount = len(new_mesh.vertices)
+#     cols = np.ones((vcount, 4), np.float32)
+#     for vi, v in enumerate(new_mesh.vertices):
+#         hits = kd.find_n(v.co, 3)
+#         if hits:
+#             cols[vi, :3] = np.mean([graded[h[1]] for h in hits], axis=0)
+#     new_mesh.color_attributes.new("Col", 'FLOAT_COLOR', 'POINT').data.foreach_set(
+#         "color", cols.ravel())
+#
+#     if smooth:
+#         new_mesh.polygons.foreach_set(
+#             "use_smooth", np.ones(len(new_mesh.polygons), dtype=bool))
+#         new_mesh.update()
+#
+#     new_mesh.materials.append(_surface_material(nm, emissive))
+#
+#     for so in context.selected_objects:
+#         so.select_set(False)
+#     obj.select_set(True)
+#     context.view_layer.objects.active = obj
+#     info = f"detail {int(detail)}, voxel {voxel:.4g} ({ratio:.1f}x a splat)"
+#     if ratio > 4.0:
+#         info += " - raise Detail to follow the contour more closely"
+#     info += snap_note
+#     return obj, vcount, len(new_mesh.polygons), info
+#
+#
+# class FGS_OT_bake_surface(Operator):
+#     bl_idname = "fgs.bake_surface"
+#     bl_label = "Bake Surface Mesh (solid)"
+#     bl_options = {'REGISTER', 'UNDO'}
+#     bl_description = ("Reconstruct ONE solid mesh from the active model's point "
+#                      "cloud: each splat contributes a blob sized by its own "
+#                      "gaussian, the density is sampled on a voxel grid and the "
+#                      "isosurface extracted, then UV-unwrapped and textured. "
+#                      "Lit like a normal object; good for sculpt/retopo, F12 "
+#                      "renders, and OBJ/glTF/STL export")
+#     auto_detail: BoolProperty(
+#         name="Match Splat Size (auto detail)", default=True,
+#         description="Choose the grid resolution from the splats themselves, "
+#                     "aiming for about two voxels per splat. The right value "
+#                     "depends on how big the splats are relative to the scene, "
+#                     "so a fixed number rarely follows the contour. Untick to "
+#                     "set Detail by hand")
+#     detail: IntProperty(
+#         name="Detail (levels per axis)", default=100, min=10, max=8000,
+#         description="Grid resolution along the model's largest axis, used "
+#                     "when auto detail is off. If this is much coarser than "
+#                     "the splats, every blob collapses to one voxel and the "
+#                     "surface cannot follow the contour - the status bar "
+#                     "reports the voxel size against the splat size")
+#     min_opacity: FloatProperty(
+#         name="Min Opacity", default=0.3, min=0.0, max=1.0,
+#         description="Ignore splats fainter than this, so haze and floaters "
+#                     "don't inflate the surface")
+#     cap: IntProperty(
+#         name="Max Points", default=300000, min=1000, max=1000000,
+#         description="Upper limit of splat centres fed into the reconstruction. "
+#                     "Splats over the limit are kept by opacity importance, so "
+#                     "solid structure survives and haze goes first")
+#     radius_scale: FloatProperty(
+#         name="Blob Size", default=1.0, min=0.25, max=4.0,
+#         description="Multiplies each splat's own radius. 1.0 follows the "
+#                     "gaussian sizes as captured. Raise it to close holes in "
+#                     "a sparse scan, lower it for a tighter, leaner surface "
+#                     "that follows fine detail more closely")
+#     threshold: FloatProperty(
+#         name="Surface Tightness", default=0.12, min=0.01, max=0.9,
+#         description="Isosurface level. LOW sits far out in each splat's "
+#                     "falloff - puffier, but closes gaps. HIGH hugs the dense "
+#                     "core - tighter to the real contour, but can open holes "
+#                     "in thin or sparse areas")
+#     snap: BoolProperty(
+#         name="Snap to Splats", default=True,
+#         description="After the isosurface is extracted, pull every vertex "
+#                     "onto the weighted plane of its nearest splats. A "
+#                     "density isosurface can only sit somewhere out in the "
+#                     "summed falloff, inflated by an amount that varies with "
+#                     "splat overlap; this projection removes that bias so "
+#                     "the shell sits ON the splats. Untick to compare "
+#                     "against the raw volume mesh")
+#     emissive: BoolProperty(
+#         name="Emissive (unlit)", default=False,
+#         description="Use an unlit emission material instead of a lit "
+#                     "Principled surface")
+#     smooth: BoolProperty(
+#         name="Shade Smooth", default=True,
+#         description="Smooth-shade the reconstructed surface")
+#     do_uv: BoolProperty(
+#         name="Generate UV Map", default=True,
+#         description="Unwrap the reconstructed surface (Smart UV Project) so "
+#                     "it can carry a texture, be painted on, or be exported "
+#                     "with its colours intact")
+#     do_texture: BoolProperty(
+#         name="Bake Colours to Texture", default=True,
+#         description="Rasterise the splat colours into an image through the "
+#                     "new UV layout and use it as the surface texture. Colour "
+#                     "detail is then set by the texture, not by how dense the "
+#                     "mesh is - and unlike vertex colours it survives export "
+#                     "to glTF / FBX / OBJ")
+#     tex_size: bpy.props.EnumProperty(
+#         name="Texture Size", default='2048',
+#         description="Resolution of the baked texture",
+#         items=[('1024', "1024 x 1024", "Fast, for small or distant models"),
+#                ('2048', "2048 x 2048", "Good default"),
+#                ('4096', "4096 x 4096", "Sharp; slower to bake and heavier")])
+#
+#     def invoke(self, context, event):
+#         return context.window_manager.invoke_props_dialog(self)
+#
+#     def execute(self, context):
+#         r = state.active_renderer(context)
+#         if r is None:
+#             self.report({'WARNING'}, "No active model - load or select one first")
+#             return {'CANCELLED'}
+#         try:
+#             obj, nv, nf, info = _bake_surface(
+#                 r, context, self.detail, self.min_opacity, self.cap,
+#                 self.emissive, self.smooth, self.radius_scale,
+#                 self.threshold, self.auto_detail, self.snap)
+#         except Exception as e:
+#             import traceback
+#             traceback.print_exc()
+#             self.report({'ERROR'}, f"Surface bake failed: {e}")
+#             return {'CANCELLED'}
+#
+#         # UV + texture live in uvtools.py; a failure there must not throw away
+#         # the surface that was just reconstructed, so it degrades to the
+#         # vertex-coloured mesh instead of cancelling.
+#         extra = ""
+#         if self.do_uv:
+#             try:
+#                 from . import uvtools
+#                 how = uvtools.smart_unwrap(obj)
+#                 extra = f", UV ({how})"
+#                 if self.do_texture:
+#                     img, cov = uvtools.bake_texture(obj, int(self.tex_size))
+#                     uvtools.apply_texture(obj, img, self.emissive)
+#                     extra += f" + {self.tex_size}px texture ({cov * 100:.0f}% used)"
+#             except Exception as e:
+#                 import traceback
+#                 traceback.print_exc()
+#                 self.report({'WARNING'},
+#                             f"Surface built, but UV/texture step failed: {e}")
+#                 return {'FINISHED'}
+#         self.report({'INFO'},
+#                     f"Built '{obj.name}': {nv:,} verts / {nf:,} faces - "
+#                     f"{info}{extra}")
+#         return {'FINISHED'}
+#
+#
+#
 class FGS_OT_click_select(Operator):
     bl_idname = "fgs.click_select"
     bl_label = "Splat Click Select"
@@ -1940,7 +2345,31 @@ class FGS_OT_click_select(Operator):
         if region is not None and rv3d is not None:
             mx = event.mouse_x - region.x
             my = event.mouse_y - region.y
-            r = state.pick_renderer_under_cursor(region, rv3d, mx, my)
+            r, t_splat = state.pick_renderer_under_cursor_ray(
+                region, rv3d, mx, my)
+            # (1.20.12) An ordinary Blender object IN FRONT of the splats wins.
+            # This operator owns plain LMB, and it used to claim any click
+            # that landed on a splat regardless of what stood between the
+            # cursor and it - so a cube parked in front of a capture could not
+            # be clicked at all. Blender's own ray_cast settles the depth
+            # question; if it hits something nearer, hand the click back.
+            if r is not None and t_splat is not None:
+                try:
+                    from bpy_extras import view3d_utils
+                    org = view3d_utils.region_2d_to_origin_3d(
+                        region, rv3d, (mx, my))
+                    dr = view3d_utils.region_2d_to_vector_3d(
+                        region, rv3d, (mx, my))
+                    dg = context.evaluated_depsgraph_get()
+                    ok, loc, _n, _i, ob, _m = context.scene.ray_cast(
+                        dg, org, dr)
+                    if ok and ob is not None:
+                        handles = {rr.box_name for rr in state.RENDERERS}
+                        if ob.name not in handles and \
+                                float((loc - org).dot(dr)) < t_splat:
+                            r = None
+                except Exception as e:
+                    print("[SplatBake] occlusion test skipped:", e)
             if r is not None:
                 box = bpy.data.objects.get(r.box_name)
                 if box is not None:
@@ -2373,8 +2802,9 @@ class FGS_OT_best_quality(Operator):
 classes = (FGS_OT_load, FGS_OT_clear, FGS_OT_reset_transform, FGS_OT_remove_active,
            FGS_OT_duplicate, FGS_OT_copy, FGS_OT_paste, FGS_OT_best_quality,
            FGS_OT_apply_display_to_all, FGS_OT_walk, FGS_OT_reload_lod,
-           FGS_OT_snapshot, FGS_OT_bake, FGS_OT_bake_surface,
-           FGS_OT_light_setup,
+           FGS_OT_snapshot, FGS_OT_bake,
+           # FGS_OT_bake_surface, FGS_OT_light_setup,  # parked -
+           # experimental solid bake + its lighting test (1.20.4)
            FGS_OT_selftest, FGS_OT_test_splat,
            FGS_OT_click_select, FGS_OT_dolly_cursor,
            FGS_OT_frame, FGS_OT_pick_orbit, FGS_OT_select_splat,

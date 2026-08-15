@@ -34,6 +34,10 @@ timer does the actual loading a moment later, so the file opens promptly and
 the models stream in after it.
 """
 
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 Blender-Claude
+
+
 import base64
 import os
 import zlib
@@ -42,7 +46,8 @@ import bpy
 import numpy as np
 from mathutils import Matrix
 
-from . import loaders, state
+from . import state
+from .splatcore import loaders
 from .renderer import SplatRenderer
 
 KEY = "splatbake"          # ID-property namespace on the handle Empty

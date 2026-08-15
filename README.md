@@ -28,10 +28,9 @@ That's the whole idea. Everything else in the panel is optional tuning.
 *Image description: Suzanne (OBJ mesh) inside a Raspberry (3DGS / PLY Gaussian
 splat).*
 
-### Credits
+### Image Credits/ Contribution:
 
 3DGS object — Raspberry:
-
 - [Raspberry — SuperSplat](https://superspl.at/scene/04bdd392)
 - [www.patreon.com/DanyBittel](https://www.patreon.com/DanyBittel)
 
